@@ -1,0 +1,10 @@
+# Master Hydra configuration for PersonaPlex fine-tuning
+# Sub-configs are located in modular directories: model/, data/, lora/, train/
+defaults:
+  - model: server
+  - data: otospeech
+  - lora: default
+  - train: 104h
+  - _self_
+
+seed: 42

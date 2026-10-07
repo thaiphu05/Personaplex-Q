@@ -1,0 +1,169 @@
+# ==============================================================================
+# config_example.yaml — PersonaPlex fine-tune, standalone config đầy đủ tham số
+# ------------------------------------------------------------------------------
+# Cách dùng:
+#   python -m personaplex_finetuning.train --config configs/config_example.yaml
+#   python -m personaplex_finetuning.train --config configs/config_example.yaml \
+#       train.max_steps=5000 lora.rank=32 model.qwen_id=/data/Qwen3.5-9B
+#
+# File standalone (không dùng `defaults:` Hydra) → load_config đọc trực tiếp.
+# Mọi key dưới đây đều là key mà config.py thực sự parse. Key lạ sẽ bị bỏ qua
+# (không crash) nếu file load qua nhánh plain-yaml; nên đối chiếu kỹ tên.
+# ==============================================================================
+
+# --- Seed: tái lập kết quả ------------------------------------------------
+seed: 42                                    # int bất kỳ; ảnh hưởng shuffle, crop, init
+
+# ==============================================================================
+# 1. MODEL — đường dẫn assets + lựa chọn backbone
+# ==============================================================================
+model:
+  # Thư mục checkpoint PersonaPlex-7B (bắt buộc):
+  #   model.safetensors                            # lấy depth transformer để graft
+  #   tokenizer-e351c8d8-checkpoint125.safetensors # Mimi codec (frozen)
+  #   tokenizer_spm_32k_3.model                    # validate() đòi đủ, dù qwen path không dùng
+  root: /storage-voice/voice/vdt/baottn/personaplex-7b-v1   # path tuyệt đối hoặc tương đối configs/
+
+  # Thư mục mã nguồn moshi vendored (chứa moshi/models/loaders.py)
+  source: ../src                              # thường là ../src khi config nằm trong configs/
+
+  # Thiết bị chạy
+  device: cuda                                # 'cuda' | 'cuda:0' | 'cpu' | 'mps'
+
+  # Backbone LM:
+  #   'personaplex' — Helium 7B gốc (LoRA cũ, stage-wise, qlora hỗ trợ)
+  #   'qwen'        — Qwen swap (Qwen3-8B hoặc Qwen3.5-9B, auto-detect LoRA surface)
+  backbone: qwen
+
+  # Chỉ dùng khi backbone: qwen — HF id HOẶC đường dẫn thư mục local
+  # (thư mục chứa config.json + model.safetensors + tokenizer files)
+  qwen_id: Qwen/Qwen3.5-9B                    # vd local: /data/models/Qwen/Qwen3.5-9B
+  # Đổi sang Qwen3-8B = đổi đúng dòng này (LoRA surface tự detect q_proj/v_proj)
+
+# ==============================================================================
+# 2. DATA — dữ liệu hội thoại đã chuẩn bị
+# ==============================================================================
+data:
+  # Thư mục chứa train.jsonl (và val.jsonl nếu có)
+  prepared_dir: /storage-voice/voice/vdt/baottn/fdp-vi
+  # Mỗi dòng train.jsonl: {"sample_id": "conv_0001", "sample_dir": "samples/conv_0001"}
+  # Mỗi sample dir:
+  #   conversation.wav          stereo, LEFT=agent, RIGHT=user
+  #   words.json                [{"speaker":"left","word":"xin chào","start":0.5,"end":1.2}, ...]
+  #   voice_prompt_left.wav     mẫu giọng agent
+  #   voice_prompt_right.wav    mẫu giọng user (cho role swap)
+  #   metadata.json             {"text_prompt_left": "...", "text_prompt_right": "..."}
+
+  # Độ dài cửa sổ huấn luyện (giây). null = nạp toàn bộ hội thoại rồi chunk
+  window_seconds: 30.0                       # float > 0 hoặc null
+
+  # Xáo trộn chunk giữa các pass
+  shuffle: true                              # true/false (smoke test bắt buộc false)
+
+  # Crop cửa sổ ngẫu nhiên quanh lời agent (data augmentation)
+  random_crop: false                         # true/false
+
+  # Xác suất thay text prompt bằng prompt khác cùng ngôn ngữ (augmentation)
+  prompt_aug_prob: 0.0                       # float 0.0 - 1.0
+
+  # Chunking tĩnh liên tiếp (debug/đơn giản); false = dùng random crop
+  static_chunking: false                     # true/false
+
+  # Đổi vai agent<->user mỗi pass (học cả 2 chiều, data x2 view)
+  swap_roles_after_pass: true                # true/false
+
+  # Tỷ lệ chia validation khi không có val.jsonl riêng
+  val_ratio: 0.05                            # float 0.01 - 0.2
+
+  # Manifest validation riêng (bỏ null để auto tìm val.jsonl)
+  val_manifest: null                         # path hoặc null
+
+# ==============================================================================
+# 3. LORA — cấu hình adapter
+# ==============================================================================
+lora:
+  # Rank/alpha cho path 'personaplex' (dùng chung cho mọi Linear)
+  rank: 16                                   # int 8/16/32/64/128
+  alpha: 32                                  # thường = 2 * rank
+
+  # Rank/alpha cho backbone Qwen (auto-detect surface)
+  qwen_rank: 64                              # r=64 cho cả 2 thế hệ
+  qwen_alpha: 128                            # scale = alpha/rank = 2.0
+
+  # Rank/alpha cho depth transformer (LoRA depformer, phương án B)
+  depformer_rank: 64
+  depformer_alpha: 128
+
+  # Override thủ công LoRA surface của Qwen; null = auto-detect.
+  #   Qwen3-8B   default: q_proj,v_proj
+  #   Qwen3.5-9B default: attn_qkv,ffn_gate,ffn_up,ffn_down
+  #   Muốn thêm k/o cho 3-8B: "q_proj,v_proj,k_proj,o_proj"
+  qwen_targets: null                         # chuỗi tên module ngăn cách dấu phẩy, hoặc null
+
+  # Fine-tune bảng embedding audio (emb 16x2049x4096 = 134M full)
+  # true = theo plan (interface học lại); false = giữ nguyên init từ PersonaPlex
+  ft_embed: true                             # true/false
+
+  # QLoRA 4-bit (chỉ path 'personaplex'; Qwen path chưa hỗ trợ qlora)
+  qlora: false                               # true/false
+  quant_type: nf4                            # 'nf4' | 'fp4'
+
+# ==============================================================================
+# 4. TRAIN — optimizer, schedule, checkpoint
+# ==============================================================================
+train:
+  # Thư mục lưu runs (mỗi run tạo subdir train_YYYYMMDD_HHMMSS)
+  output_dir: ../runs/qwen35                 # path tương đối/abs
+
+  # Tổng số optimizer update
+  max_steps: 10000                           # int; 2000h data → 20-50k steps hợp lý
+
+  # LR backbone LoRA
+  #   personaplex path: temporal (stage joint) = 2e-5
+  #   qwen path:        LoRA Qwen (attn/ffn)  = 1e-5
+  learning_rate: 1.0e-5
+
+  # LR depth (chỉ path personaplex, dùng khi depformer_learning_rate khác learning_rate)
+  depformer_learning_rate: null              # float hoặc null
+
+  # --- Chỉ path qwen: 3 nhóm LR riêng ---
+  interface_lr: 5.0e-5                       # depth I/O + depformer LoRA + text_depth_adapter
+  audio_embed_lr: 1.0e-4                     # emb (bảng embedding audio, nếu ft_embed=true)
+
+  # Stage-wise (chỉ path personaplex): 'joint' | 'temporal_only' | 'depth_only'
+  stage: joint
+
+  # Số micro-batch tích luỹ gradient trước 1 optimizer step
+  gradient_accumulation_steps: 8             # int >= 1
+
+  # Warmup tuyến tính → cosine decay
+  warmup_steps: 1000                         # int >= 0
+
+  # Tần suất đánh giá validation (loss), 0 = tắt
+  eval_every_steps: 500                      # int >= 0
+
+  # Tần suất lưu checkpoint (lora.safetensors + training_state.pt)
+  save_every_steps: 500                      # int >= 1
+
+  # Gradient checkpointing — đổi VRAM lấy compute (nên bật)
+  gradient_checkpointing: true               # true/false
+
+  # Mixed precision: 'bf16' (khuyên dùng) | 'fp16' | 'no'
+  mixed_precision: bf16
+
+# ==============================================================================
+# 5. LOSS WEIGHTS — KHÔNG parse từ config (hardcode trong objective.py)
+#    Muốn đổi: sửa mặc định trong src/personaplex_finetuning/objective.py
+#    - nonsemantic_audio_weight: 0.02   (codebook 2-8)
+#    - text_padding_weight: 0.3         (token padding text)
+#    - codebook 0 (semantic): trọng số 1.0
+#    - user stream (9-16): weight 0
+#    - vùng system prompt: mask (không học)
+# ==============================================================================
+
+# ==============================================================================
+# 6. GENERATION — KHÔNG dùng khi train (chỉ configs/demo.yaml khi chạy demo)
+#    Hiện có: use_sampling, temp, temp_text, top_k, top_k_text
+#    CHƯA có: top_p, min_p, presence_penalty, repetition_penalty
+#    (moshi sampling chỉ top-k; Qwen path M5 có thể dùng HF generate() có sẵn)
+# ==============================================================================

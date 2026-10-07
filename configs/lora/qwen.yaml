@@ -1,0 +1,14 @@
+# Qwen swap LoRA configuration (uniform rank 64, FP32 adapters)
+# LoRA surface auto-detected from the backbone (qwen3 vs qwen3_5);
+# override per-module with qwen_targets, e.g. "q_proj,v_proj,k_proj,o_proj".
+# ft_embed: audio embedding tables (emb) are trainable as in the plan (134M full)
+rank: 64
+alpha: 128
+qwen_rank: 64
+qwen_alpha: 128
+depformer_rank: 64
+depformer_alpha: 128
+qwen_targets: "q_proj,v_proj"
+ft_embed: true
+qlora: false
+quant_type: nf4

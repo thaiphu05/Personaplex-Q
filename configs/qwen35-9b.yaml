@@ -1,0 +1,10 @@
+# Master Hydra configuration: Qwen3.5-9B backbone swap
+# Run: python -m personaplex_finetuning.train --config configs/qwen35-9b.yaml
+defaults:
+  - model: qwen35-9b
+  - data: vietnamese
+  - lora: qwen
+  - train: qwen
+  - _self_
+
+seed: 42

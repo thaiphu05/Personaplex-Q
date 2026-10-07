@@ -1,0 +1,12 @@
+# Qwen3.5-9B swap training configuration
+output_dir: ../runs/qwen35
+max_steps: 10000
+learning_rate: 1.0e-5
+interface_lr: 5.0e-5
+audio_embed_lr: 1.0e-4
+gradient_accumulation_steps: 8
+warmup_steps: 1000
+eval_every_steps: 500
+save_every_steps: 500
+gradient_checkpointing: true
+mixed_precision: bf16

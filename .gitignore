@@ -1,0 +1,15 @@
+__pycache__/
+.DS_Store
+*.py[cod]
+.pytest_cache/
+.venv/
+.env
+/models/
+outputs/
+runs/
+reports/
+assets/
+configs/server.local.yaml
+*.safetensors
+*.pt
+*.ckpt

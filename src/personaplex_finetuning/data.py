@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 import wave
 import dataclasses
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -211,7 +213,7 @@ class PreparedDataset:
     def load(self) -> list[PreparedSample]:
         if not self.manifest.is_file():
             raise ValidationError(f"manifest does not exist: {self.manifest}")
-        samples: list[PreparedSample] = []
+        entries: list[tuple[int, dict[str, Any]]] = []
         for line_number, line in enumerate(self.manifest.read_text(encoding="utf-8").splitlines(), 1):
             if not line.strip():
                 continue
@@ -219,9 +221,29 @@ class PreparedDataset:
                 entry = json.loads(line)
             except json.JSONDecodeError as exc:
                 raise ValidationError(f"invalid JSONL at line {line_number}: {exc}") from exc
-            sample = self._load_entry(entry, line_number)
-            if sample is not None:
-                samples.append(sample)
+            entries.append((line_number, entry))
+        samples: list[PreparedSample] = []
+        dropped_words = 0
+        skipped = 0
+        workers = min(32, os.cpu_count() or 1)
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            results = executor.map(
+                self._load_entry,
+                (entry for _, entry in entries),
+                (line_number for line_number, _ in entries),
+            )
+            for sample, dropped in results:
+                dropped_words += dropped
+                if sample is None:
+                    skipped += 1
+                else:
+                    samples.append(sample)
+        if dropped_words or skipped:
+            print(
+                f"[data] {self.manifest}: dropped {dropped_words} out-of-bounds word(s), "
+                f"skipped {skipped} sample(s) with no agent words",
+                file=sys.stderr,
+            )
         if not samples:
             raise ValidationError(f"manifest has no samples: {self.manifest}")
         ids = [sample.sample_id for sample in samples]
@@ -243,7 +265,7 @@ class PreparedDataset:
         train_set = shuffled[val_size:]
         return train_set, val_set
 
-    def _load_entry(self, entry: dict[str, Any], line_number: int) -> PreparedSample | None:
+    def _load_entry(self, entry: dict[str, Any], line_number: int) -> tuple[PreparedSample | None, int]:
         sample_id = str(entry.get("sample_id", "")).strip()
         sample_dir = entry.get("sample_dir")
         if not sample_id or not isinstance(sample_dir, str):
@@ -278,11 +300,10 @@ class PreparedDataset:
         text_prompt = str(metadata.get("text_prompt_left", "")).strip()
         if not text_prompt:
             raise ValidationError(f"{sample_id}: metadata.text_prompt_left is required")
-        words = self._read_words(words_path, sample_id, audio.duration_sec)
+        words, dropped = self._read_words(words_path, sample_id, audio.duration_sec)
         agent_words = [word for word in words if word.speaker == "agent"]
         if not agent_words:
-            print(f"[data] {sample_id}: skipped sample with no agent words", file=sys.stderr)
-            return None
+            return None, dropped
         start = agent_words[0].start
         end = min(audio.duration_sec, start + self.window_seconds)
         return PreparedSample(
@@ -297,7 +318,7 @@ class PreparedDataset:
             window_end_sec=end,
             voice_prompt_right_wav=voice_prompt_right if voice_prompt_right.is_file() else None,
             text_prompt_right=str(metadata.get("text_prompt_right", "")).strip() or None,
-        )
+        ), dropped
 
     @staticmethod
     def _read_object(path: Path, sample_id: str) -> dict[str, Any]:
@@ -310,7 +331,7 @@ class PreparedDataset:
         return parsed
 
     @staticmethod
-    def _read_words(path: Path, sample_id: str, duration_sec: float) -> list[Word]:
+    def _read_words(path: Path, sample_id: str, duration_sec: float) -> tuple[list[Word], int]:
         try:
             raw_words = json.loads(path.read_text(encoding="utf-8"))
         except json.JSONDecodeError as exc:
@@ -338,6 +359,4 @@ class PreparedDataset:
                 raise ValidationError(f"{sample_id}: words are not sorted by start")
             last_start = start
             words.append(Word(speaker, word, start, end))
-        if dropped:
-            print(f"[data] {sample_id}: dropped {dropped} out-of-bounds word(s)", file=sys.stderr)
-        return words
+        return words, dropped

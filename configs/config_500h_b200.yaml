@@ -1,0 +1,52 @@
+# ==============================================================================
+# 500h synthetic (no-diacritics) — PersonaPlex 7B LoRA, 2× B200
+# Standalone (non-Hydra) config:
+#   python -m personaplex_finetuning.train --config configs/config_500h_b200.yaml
+#   smoke: thêm --smoke data.shuffle=false
+#
+# Không có trong repo (bỏ qua so với script trainer gốc):
+#   user_loss, weight_decay/pct_start, num_workers/filter_num_workers/prefetch_*,
+#   free_running_eval_*, validation_max_samples, first_codebook_weight_multiplier,
+#   text_padding_weight (hardcode 0.3), sample_number/sample_index, profile_steps,
+#   no_eval, randomize_train, vietnamese_text_mode, test_manifest_path, log_freq.
+#   generation.* → xem configs/demo.yaml
+# ==============================================================================
+
+seed: 42
+
+model:
+  root: /home/voice/data/voice/personaplex-7b-v1   # phải đủ 3 file PersonaPlex
+  source: ../src
+  device: cuda                                     # backbone mặc định = personaplex (Helium 7B)
+
+data:
+  prepared_dir: /home/voice/data/voice/vdt/data_ready/synthetic_500h
+  window_seconds: 100            # thay duration_sec: 100 (null không hỗ trợ)
+  shuffle: true
+  random_crop: false             # randomize_train không hỗ trợ
+  prompt_aug_prob: 0.0
+  static_chunking: false
+  swap_roles_after_pass: false   # giữ nguyên từ config gốc
+  val_ratio: 0.05
+  # val_manifest: <path>         # bỏ trống = tự dùng val.jsonl nếu có
+
+lora:
+  rank: 128
+  alpha: 256
+  qlora: false
+  quant_type: nf4
+  ft_embed: false
+
+train:
+  output_dir: ../runs/train-synthetic-no-diaritics-joint-userloss
+  learning_rate: 2.0e-6          # optim.lr
+  depformer_learning_rate: 5.0e-6
+  stage: joint
+  max_steps: 2000                # giữ từ config gốc; 2 pass đầy đủ ≈ 8550
+                                 # (kiểm tra num_train_samples in lúc startup, gbs = 1×2GPU×2 = 4)
+  gradient_accumulation_steps: 2
+  warmup_steps: 0
+  eval_every_steps: 500
+  save_every_steps: 500          # = ckpt_freq
+  gradient_checkpointing: true
+  mixed_precision: bf16

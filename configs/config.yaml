@@ -1,10 +1,44 @@
-# Master Hydra configuration for PersonaPlex fine-tuning
-# Sub-configs are located in modular directories: model/, data/, lora/, train/
+# Master Hydra configuration — Qwen3.5-9B backbone on B200 (Blackwell sm_100)
+# Requires: CUDA 12.8, torch>=2.7 (cu128), transformers>=4.57
+# Run: python -m personaplex_finetuning.train --config configs/config.yaml
+# Smoke first: add --smoke
 defaults:
-  - model: server
-  - data: otospeech
-  - lora: default
-  - train: 104h
+  - model: qwen35-9b
+  - data: vietnamese
+  - lora: qwen
+  - train: qwen
   - _self_
 
 seed: 42
+
+# --- B200 overrides (override presets above) ---
+model:
+  root: ../models                  # PersonaPlex-7B checkpoint dir (Mimi codec + depformer graft)
+  source: ../src
+  device: cuda
+  backbone: qwen
+  qwen_id: Qwen/Qwen3.5-9B         # HF id or local path (auto-downloaded by transformers)
+
+data:
+  prepared_dir: ../prepared        # prepared dataset dir (train.jsonl + samples/)
+
+train:
+  output_dir: ../runs/qwen35-b200
+  max_steps: 10000
+  learning_rate: 1.0e-5            # backbone LoRA
+  interface_lr: 5.0e-5             # depth I/O + adapters
+  audio_embed_lr: 1.0e-4
+  gradient_accumulation_steps: 8
+  warmup_steps: 1000
+  eval_every_steps: 500
+  save_every_steps: 500
+  gradient_checkpointing: false    # 9B fits easily in 180GB VRAM
+  mixed_precision: bf16            # native on Blackwell
+
+lora:
+  qwen_rank: 64
+  qwen_alpha: 128
+  depformer_rank: 64
+  depformer_alpha: 128
+  ft_embed: true
+  qlora: false                     # QLoRA unsupported on Qwen path

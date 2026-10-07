@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sys
 import wave
 import dataclasses
 from dataclasses import dataclass
@@ -218,7 +219,9 @@ class PreparedDataset:
                 entry = json.loads(line)
             except json.JSONDecodeError as exc:
                 raise ValidationError(f"invalid JSONL at line {line_number}: {exc}") from exc
-            samples.append(self._load_entry(entry, line_number))
+            sample = self._load_entry(entry, line_number)
+            if sample is not None:
+                samples.append(sample)
         if not samples:
             raise ValidationError(f"manifest has no samples: {self.manifest}")
         ids = [sample.sample_id for sample in samples]
@@ -240,7 +243,7 @@ class PreparedDataset:
         train_set = shuffled[val_size:]
         return train_set, val_set
 
-    def _load_entry(self, entry: dict[str, Any], line_number: int) -> PreparedSample:
+    def _load_entry(self, entry: dict[str, Any], line_number: int) -> PreparedSample | None:
         sample_id = str(entry.get("sample_id", "")).strip()
         sample_dir = entry.get("sample_dir")
         if not sample_id or not isinstance(sample_dir, str):
@@ -278,7 +281,8 @@ class PreparedDataset:
         words = self._read_words(words_path, sample_id, audio.duration_sec)
         agent_words = [word for word in words if word.speaker == "agent"]
         if not agent_words:
-            raise ValidationError(f"{sample_id}: no agent words")
+            print(f"[data] {sample_id}: skipped sample with no agent words", file=sys.stderr)
+            return None
         start = agent_words[0].start
         end = min(audio.duration_sec, start + self.window_seconds)
         return PreparedSample(
@@ -314,6 +318,7 @@ class PreparedDataset:
         if not isinstance(raw_words, list):
             raise ValidationError(f"{sample_id}: words.json must be a JSON array")
         words: list[Word] = []
+        dropped = 0
         last_start = -1.0
         for index, raw in enumerate(raw_words):
             if not isinstance(raw, dict):
@@ -326,10 +331,13 @@ class PreparedDataset:
                 raise ValidationError(f"{sample_id}: word {index} has invalid timestamps") from exc
             if speaker is None or not word:
                 raise ValidationError(f"{sample_id}: word {index} has invalid speaker or text")
-            if start < 0 or end <= start or end > duration_sec + 0.05:
-                raise ValidationError(f"{sample_id}: word {index} is outside audio bounds")
+            if start < 0 or end <= start or start >= duration_sec or end > duration_sec + 0.05:
+                dropped += 1
+                continue
             if start < last_start:
                 raise ValidationError(f"{sample_id}: words are not sorted by start")
             last_start = start
             words.append(Word(speaker, word, start, end))
+        if dropped:
+            print(f"[data] {sample_id}: dropped {dropped} out-of-bounds word(s)", file=sys.stderr)
         return words

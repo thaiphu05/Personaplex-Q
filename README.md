@@ -1,190 +1,105 @@
-# PersonaPlex LoRA Fine-Tuning & Live Interaction — Full Guide
+# PersonaPlex LoRA Fine-Tuning, Live Interaction & Full-Duplex Benchmark
 
-Tài liệu hướng dẫn thiết lập môi trường, toàn bộ **các lệnh kiểm tra (pre-flight checks & validation)** trước khi thực thi, và **các lệnh chạy chính** (huấn luyện LoRA, đàm thoại trực tiếp) cho mô hình `nvidia/personaplex-7b-v1`.
+End-to-end pipeline for fine-tuning [`nvidia/personaplex-7b-v1`](https://huggingface.co/nvidia/personaplex-7b-v1) with LoRA adapters, chatting with the model in real time (terminal CLI or Gradio web UI), and evaluating full-duplex conversational skills with the [Full-Duplex-Bench](https://arxiv.org/abs/2412.06251) protocol.
+
+> 🇻🇳 *Pipeline huấn luyện LoRA cho PersonaPlex-7B, đàm thoại song công trực tiếp qua micro/loa hoặc web UI, và đánh giá Full-Duplex-Bench.*
+
+## What this repo provides
+
+| Feature | Description |
+| :--- | :--- |
+| **LoRA fine-tuning** | LoRA adapters over the PersonaPlex 7B transformer (temporal), optional depformer LoRA, 4-bit QLoRA. Single GPU or multi-GPU DDP via Accelerate. |
+| **Stage-wise training** | Stage 0 Mimi audio codec adaptation → temporal-only → depth-only → joint with dual learning rates. |
+| **Qwen backbone swap** | Replace the Helium 7B backbone with `Qwen/Qwen3-8B` or `Qwen/Qwen3.5-9B` (auto-detected LoRA surfaces). |
+| **Live interaction** | Full-duplex terminal CLI (mic ↔ speakers) and Gradio web UI with temporary public `gradio.live` links. |
+| **Full-Duplex-Bench** | Offline evaluation of pause handling, backchanneling, smooth turn-taking, and user interruption — no external ASR needed. |
+| **Pre-flight tooling** | Dataset validation, frame inspection, Mimi codec fidelity tests, 1-step smoke tests, unit test suite. |
+
+> 🇻🇳 *2 backbone: PersonaPlex 7B gốc hoặc Qwen3-8B / Qwen3.5-9B. Công cụ kiểm tra + huấn luyện + demo + benchmark trong 1 repo.*
 
 ---
 
-## 1. Thiết lập môi trường (Environment Setup)
+## 1. Requirements & Environment Setup
 
-> **Lưu ý quan trọng**:
-> - Sử dụng Conda env hoặc virtualenv (`.venv`) cục bộ; không cài đè lên môi trường hệ thống.
-> - Sử dụng **Python 3.10 hoặc 3.11**.
-> - PyTorch yêu cầu phiên bản **Torch 2.4.x** (CUDA 12.1 hoặc 12.4 trên Linux/Windows, hoặc MPS/CPU trên macOS); **không dùng Torch 2.8**.
-> - Bắt buộc cài đặt `ffmpeg` để xử lý audio 24kHz / stereophonic.
+### Requirements
 
-### Cách A: Sử dụng Conda (Khuyên dùng)
+- **Python 3.10 or 3.11**
+- **PyTorch**: `>=2.2,<2.5` for the PersonaPlex backbone. The **Qwen backbone swap requires `torch>=2.6` + `transformers>=4.57`** (Qwen3.5 architecture).
+- **ffmpeg** (+ `libsox-fmt-all` on Linux) for 24 kHz stereo audio processing.
+- CUDA 12.1/12.4 GPU (Linux), or MPS/CPU (macOS).
+- Do not install over your system Python — use conda or a venv.
+
+> 🇻🇳 *Python 3.10/3.11, Torch 2.4.x (PersonaPlex) hoặc ≥2.6 (Qwen), ffmpeg bắt buộc.*
+
+### Option A: Conda
 
 ```bash
-# 1. Tạo và kích hoạt môi trường conda với Python 3.11
-conda create -n personaplex python=3.11 -y
-conda activate personaplex
+conda env create -f environment.yml          # offline env, torch installed separately
+# or, if you plan to download from Hugging Face:
+conda env create -f environment.hf.yml       # includes huggingface-hub + aiohttp
+conda activate personaplex-overfit
+```
 
-# 2. Cài đặt ffmpeg qua conda-forge
-conda install -c conda-forge ffmpeg -y
+Then install PyTorch and the project:
 
-# 3. Cài đặt PyTorch 2.4.1 tương thích CUDA 12.4 (Nếu dùng Mac: pip install torch==2.4.1 torchaudio==2.4.1)
+```bash
 pip install torch==2.4.1 torchaudio==2.4.1 --index-url https://download.pytorch.org/whl/cu124
-
-# 4. Cài đặt các phụ thuộc dự án từ thư mục personaplex-finetuning
 pip install -r requirements.txt
-
-# 5. Cài đặt gói ở chế độ editable và thiết lập PYTHONPATH
-pip install -e .
+pip install -e ".[hub]"
 export PYTHONPATH="$PWD/src${PYTHONPATH:+:$PYTHONPATH}"
 ```
 
-### Cách B: Sử dụng Python venv cục bộ
+*(macOS Apple Silicon: `pip install torch==2.4.1 torchaudio==2.4.1` without `--index-url`.)*
+
+> 🇻🇳 *`environment.hf.yml` = thêm HF Hub; `environment.yml` = offline.*
+
+### Option B: Local venv
 
 ```bash
-# 1. Tạo và kích hoạt virtualenv
 python3.11 -m venv .venv
 source .venv/bin/activate
-
-# 2. Cập nhật pip và cài đặt PyTorch với CUDA 12.4
 pip install --upgrade pip
 pip install torch==2.4.1 torchaudio==2.4.1 --index-url https://download.pytorch.org/whl/cu124
-
-# 3. Cài đặt các thư viện dự án
 pip install -r requirements.txt
-pip install -e .
+pip install -e ".[hub]"
 export PYTHONPATH="$PWD/src${PYTHONPATH:+:$PYTHONPATH}"
 ```
 
-### Cách C: Script tự động cho GPU Server (1 lệnh duy nhất)
+### Option C: One-command GPU server setup
 
 ```bash
-# Tự động cài ffmpeg, PyTorch CUDA 12.4, dependencies, hf_transfer và kiểm tra GPU
 bash scripts/setup_server_env.sh
 ```
 
----
+Installs `ffmpeg`/`libsox-fmt-all` via apt, PyTorch 2.4.1, project requirements, HF CLI + `hf_transfer`, then prints a CUDA sanity check.
 
-## 2. Các lệnh kiểm tra trước khi chạy lệnh chính (Pre-flight Checks)
+> 🇻🇳 *Script tự động cho GPU server Linux: apt → torch → deps → kiểm tra GPU.*
 
-Chạy tuần tự các lệnh kiểm tra sau để đảm bảo 100% môi trường, phần cứng, file trọng số và dữ liệu đã sẵn sàng trước khi bắt đầu huấn luyện hoặc demo.
-
-### 2.1. Kiểm tra Python, PyTorch & Thư viện bắt buộc
-Xác minh phiên bản PyTorch, khả năng tăng tốc phần cứng (CUDA trên Linux GPU, MPS trên Apple Silicon) và các thư viện cốt lõi:
+### Qwen backbone extra requirements
 
 ```bash
-python -c "
-import torch
-print('=== Kiểm tra môi trường ===')
-print('PyTorch:', torch.__version__)
-print('CUDA available:', torch.cuda.is_available())
-print('MPS available (macOS):', torch.backends.mps.is_available())
-for pkg in ['sphn', 'sounddevice', 'sentencepiece', 'safetensors', 'einops', 'accelerate', 'gradio']:
-    __import__(pkg)
-    print(f'{pkg}: OK')
-print('===========================')
-"
+pip install "transformers>=4.57" "torch>=2.6"
 ```
 
-### 2.2. Kiểm tra phần cứng âm thanh (Microphone & Loa)
-Liệt kê danh sách các thiết bị âm thanh đầu vào/đầu ra trên máy để phục vụ live demo:
-
-```bash
-python -m tools.interactive_cli --list-devices
-```
-**Ý nghĩa các cờ (flags):**
-- `--list-devices` **[Optional]**: Truy vấn CoreAudio/ALSA và in bảng ID, tên thiết bị micro và loa có sẵn rồi thoát.
+Only needed when training with `backbone=qwen`.
 
 ---
 
-### 2.3. Kiểm tra file Checkpoint Model PersonaPlex cục bộ
-Đảm bảo thư mục model chứa đủ 3 file trọng số bắt buộc (tổng dung lượng ~17GB):
+## 2. Model & Dataset Download
+
+Model checkpoint (3 files, ~17 GB total):
+
+| File | Size | Role |
+| :--- | :--- | :--- |
+| `model.safetensors` | ~16.7 GB | PersonaPlex 7B transformer weights |
+| `tokenizer-e351c8d8-checkpoint125.safetensors` | ~384 MB | Mimi audio codec (frozen) |
+| `tokenizer_spm_32k_3.model` | ~552 KB | SentencePiece text tokenizer |
 
 ```bash
-ls -lh ../models
-```
-**Yêu cầu tối thiểu:**
-- `model.safetensors` (~16.7 GB): Trọng số 7B Transformer của PersonaPlex.
-- `tokenizer-e351c8d8-checkpoint125.safetensors` (~384 MB): Trọng số Mimi Audio Codec.
-- `tokenizer_spm_32k_3.model` (~552 KB): Bộ từ vựng SentencePiece text tokenizer.
-
-*(Nếu chưa có model, xem mục 3 bên dưới để tải tự động từ Hugging Face).*
-
----
-
-### 2.4. Kiểm tra & Xác thực Dữ liệu huấn luyện (Validate Dataset)
-Kiểm tra cấu trúc file, định dạng stereo WAV (kênh LEFT: Agent, kênh RIGHT: User), file căn chỉnh từ (`words.json`), file voice prompt và file text prompt:
-
-```bash
-# Kiểm tra tập mẫu overfit 10 hội thoại
-python -m tools.validate_dataset data=overfit
-
-# Hoặc kiểm tra tập dữ liệu quy mô lớn (104 giờ)
-python -m tools.validate_dataset data=otospeech
-```
-
----
-
-### 2.5. Kiểm tra chi tiết cấu trúc frame một mẫu (Inspect Sample)
-Kiểm tra cấu trúc frame Mimi, số frame Hybrid System Prompt (voice prompt + silence + text prompt + silence), số frame dialogue, và số vị trí token được tính loss mask:
-
-```bash
-python -m tools.inspect_sample data=overfit model=local --index 0
-```
-
-**Chi tiết các đối số (arguments):**
-- `data=<preset>`: Chọn bộ dữ liệu (`overfit`, `otospeech`, `vietnamese`, `kaggle`).
-- `model=<preset>`: Chọn đường dẫn model (`local`, `server`, `kaggle`).
-- `--index` **[Optional]**: Thứ tự index của mẫu trong danh sách dataset cần kiểm tra (mặc định: `0`).
-
----
-
-### 2.6. Chạy bộ Unit Tests tự động
-Chạy toàn bộ các bài test tự động của dự án (kiểm tra phân giải LoRA adapter, cấu hình, objective loss weights, session frame stepping):
-
-```bash
-python -m unittest discover tests
-```
-
----
-
-### 2.7. Chạy 1-Step Smoke Test (Kiểm tra Forward & Backward trên GPU)
-Kiểm tra nhanh xem pipeline mô hình, forward, backward, LoRA gradient và freeze base parameters có hoạt động đúng trên GPU hay không:
-
-```bash
-python -m personaplex_finetuning.train data=overfit train=overfit model=local --smoke
-```
-*(hoặc dùng lệnh rút gọn: `python -m tools.train_smoke data=overfit train=overfit model=local`)*
-
-**Chi tiết các đối số (arguments):**
-- `--smoke` **[Required cho smoke test]**: Chạy duy nhất 1 step (`max_steps=1`), xác thực gradient của các lớp LoRA khác 0, kiểm tra tham số gốc hoàn toàn đóng băng, lưu adapter và reload lại để kiểm tra sai số suy luận.
-
----
-
-### 2.8. Đánh giá độ tương thích của Mimi Audio Codec (Đặc biệt cho tiếng Việt)
-Kiểm tra chất lượng tái tạo âm thanh qua Mimi Codec (Mimi Encode -> Decode) để đo đạc chỉ số SNR (dB), SI-SDR (dB) và nghe thử các dấu thanh điệu tiếng Việt:
-
-```bash
-# Đánh giá 1 file âm thanh cụ thể
-python -m tools.test_mimi --input path/to/sample.wav --model-root ../models
-
-# Hoặc đánh giá toàn bộ thư mục âm thanh tiếng Việt
-python -m tools.test_mimi --input path/to/vietnamese_wavs/ --num-codebooks 8 --output-dir outputs/mimi_vi_test
-```
-
-**Các tiêu chí đánh giá:**
-- `SI-SDR >= 12 dB`: Xuất sắc, bảo toàn hoàn hảo âm vị và thanh điệu.
-- `SI-SDR 8 - 12 dB`: Khá tốt, âm thanh rõ ràng, nghe rõ ngữ nghĩa.
-- `SI-SDR < 8 dB`: Cảnh báo, có nguy cơ mất dấu hoặc biến dạng cao độ ($F_0$) -> cần Fine-tune Mimi trước (Stage 1).
-
----
-
-## 3. Chuẩn bị Model Checkpoint & Dữ liệu (Nếu chưa có sẵn)
-
-Nếu bạn thiết lập máy mới chưa có sẵn weights mô hình hoặc dataset:
-
-```bash
-# 1. Bật tăng tốc tải đa luồng qua Rust backend (hf_transfer)
 export HF_HUB_ENABLE_HF_TRANSFER=1
+hf auth login   # requires accepting the terms at https://huggingface.co/nvidia/personaplex-7b-v1
 
-# 2. Đăng nhập Hugging Face (cần chấp thuận điều khoản tại https://huggingface.co/nvidia/personaplex-7b-v1)
-hf auth login
-
-# Cách 1: Tải trực tiếp bằng lệnh hf (Khuyên dùng - Nhanh nhất)
+# Way 1: direct hf download (fastest)
 hf download nvidia/personaplex-7b-v1 \
   model.safetensors \
   tokenizer-e351c8d8-checkpoint125.safetensors \
@@ -195,168 +110,269 @@ hf download ngocbao220/personaplex-otospeech-prepared \
   --repo-type dataset \
   --local-dir prepared
 
-# Cách 2: Tải tự động qua tool Python có sẵn trong repo
+# Way 2: repo tool
 python -m tools.download_hf_assets \
   --assets-dir assets \
   --dataset-repo ngocbao220/personaplex-otospeech-prepared \
   --model-repo nvidia/personaplex-7b-v1 \
   --revision main
+
+# Way 3: wrapper script (requires hf CLI + login)
+bash scripts/download_hf_assets.sh --assets-dir assets
 ```
 
-**Chi tiết các đối số (arguments cho Cách 2):**
-- `--assets-dir` **[Optional]**: Thư mục lưu weights và dataset tải về (mặc định: `assets`).
-- `--dataset-repo` **[Optional]**: Tên repository dataset trên Hugging Face Hub.
-- `--model-repo` **[Optional]**: Tên repository chứa checkpoint PersonaPlex 7B.
-- `--revision` **[Optional]**: Nhánh hoặc commit hash muốn tải về (mặc định: `main`).
+To publish your own prepared dataset back to the Hub:
+
+```bash
+python -m tools.publish_prepared --prepared-dir ../prepared --repo-id <your-account>/<dataset> --dry-run
+```
+
+> 🇻🇳 *Qwen backbone (`qwen_id: Qwen/Qwen3-8B`) tự tải qua transformers khi train — không cần tải tay.*
 
 ---
 
-## 4. Các lệnh chạy chính (Main Execution Commands)
+## 3. Pre-flight Checks
 
-### 4.1. Huấn luyện LoRA Fine-Tuning (Single GPU)
+Run in order before training or demo.
+
+### 3.1 Environment check
 
 ```bash
-# Huấn luyện overfit trên 10 mẫu với model local
-python -m personaplex_finetuning.train \
-  data=overfit \
-  train=overfit \
-  model=local
-
-# Hoặc tùy biến trực tiếp các siêu tham số
-python -m personaplex_finetuning.train \
-  data=overfit \
-  train=overfit \
-  model=local \
-  train.learning_rate=2.0e-5 \
-  train.max_steps=300 \
-  lora.rank=16 \
-  lora.alpha=32
+python -c "
+import torch
+print('PyTorch:', torch.__version__)
+print('CUDA available:', torch.cuda.is_available())
+print('MPS available (macOS):', torch.backends.mps.is_available())
+for pkg in ['sphn', 'sounddevice', 'sentencepiece', 'safetensors', 'einops', 'accelerate', 'gradio']:
+    __import__(pkg); print(f'{pkg}: OK')
+"
 ```
 
-**Chi tiết các cờ CLI (flags):**
-- `data=<preset>`: Chọn dataset (`overfit`, `otospeech`, `vietnamese`, `kaggle`).
-- `train=<preset>`: Chọn chế độ train (`overfit`, `full`).
-- `model=<preset>`: Chọn đường dẫn model (`local`, `server`, `kaggle`).
-- `lora=<preset>`: Chọn cấu hình LoRA (`default`, `qlora`, `kaggle`).
-- `--qlora` / `--no-qlora` **[Optional]**: Bật hoặc tắt lượng tử hóa 4-bit QLoRA (`nf4`) để giảm dung lượng VRAM.
-- `--resume-from` **[Optional]**: Đường dẫn checkpoint directory hoặc `lora.safetensors` để tiếp tục huấn luyện. Checkpoint mới khôi phục adapter, optimizer và scheduler; phải giữ nguyên số GPU và `train.gradient_accumulation_steps`. Checkpoint cũ chỉ có adapter vẫn nạp được với optimizer mới.
+### 3.2 Audio hardware (microphone & speakers)
 
-**Các tham số override trực tiếp (dotlist overrides) [Optional]:**
-- `train.learning_rate`: Tốc độ học (Learning Rate). Thường dùng `2.0e-5` cho 10 mẫu overfit, `1.0e-5` cho tập lớn.
-- `train.max_steps`: Tổng số bước huấn luyện (steps).
-- `lora.rank`: Thứ hạng ma trận LoRA (Rank, mặc định `16`).
-- `lora.alpha`: Hệ số tỉ lệ LoRA alpha (thường đặt bằng `2 * rank`, tức `32`).
-- `data.window_seconds`: Độ dài cửa sổ thời gian (giây) lấy từ hội thoại để đưa vào huấn luyện (ví dụ: `30`).
-- `train.output_dir`: Thư mục lưu checkpoint adapter và log metric.
-- `train.gradient_accumulation_steps`: Số bước tích lũy gradient để tăng effective batch size.
-- `train.gradient_checkpointing`: Đặt `true` để tiết kiệm bộ nhớ GPU.
-- `train.mixed_precision`: Chế độ precision (`bf16` hoặc `fp16`).
+```bash
+python -m tools.interactive_cli --list-devices
+```
+
+Lists CoreAudio/ALSA input/output devices and exits.
+
+### 3.3 Local checkpoint files
+
+```bash
+ls -lh ../models
+```
+
+Expect the 3 files from the table in §2.
+
+### 3.4 Validate the training dataset
+
+```bash
+python -m tools.validate_dataset --config configs/config.yaml
+```
+
+Checks structure, stereo WAV (LEFT=agent, RIGHT=user), `words.json` alignment, voice prompts, and text prompts.
+
+> ⚠️ **Note**: `configs/config.yaml` currently references `train: 104h` which no longer exists under `configs/train/` (available: `full`, `overfit`, `qwen`). If Hydra composition fails, edit that line to `train: full`, or use `configs/config_example.yaml` as a standalone config.
+
+> 🇻🇳 *Tool hiện dùng `--config`; style cũ `data=overfit model=local` không còn áp dụng cho tools này.*
+
+### 3.5 Inspect one sample's frame structure
+
+```bash
+python -m tools.inspect_sample --config configs/config.yaml --index 0 --device cuda
+```
+
+Prints Mimi frame structure, hybrid system prompt frames (voice + silence + text + silence), dialogue frames, and loss-masked token positions.
+
+### 3.6 Unit tests
+
+```bash
+python -m unittest discover tests
+```
+
+### 3.7 1-step smoke test (forward + backward + LoRA gradient + reload check)
+
+```bash
+python -m personaplex_finetuning.train \
+  --config configs/config.yaml \
+  model=local data=otospeech data.prepared_dir=../prepared train=overfit \
+  --smoke
+
+# shortcut with the same behavior:
+python -m tools.train_smoke --config configs/config.yaml model=local train=overfit
+```
+
+`--smoke` runs 1 optimizer step, verifies LoRA gradients are non-zero, base parameters stay frozen, saves the adapter, and reloads it to compare inference loss.
+
+### 3.8 Mimi audio codec fidelity (esp. Vietnamese tones)
+
+```bash
+# single file
+python -m tools.test_mimi --input path/to/sample.wav --model-root ../models
+
+# whole directory of Vietnamese audio
+python -m tools.test_mimi --input path/to/vietnamese_wavs/ \
+  --num-codebooks 8 --num-samples 600 --output-dir outputs/mimi_vi_test
+```
+
+Scoring: `SI-SDR >= 12 dB` excellent · `8–12 dB` good · `< 8 dB` risk of lost tones/pitch → run Stage 0 Mimi fine-tuning first (§5.3).
+
+> 🇻🇳 *Flags mới: `--num-samples`, `--seed`, `--save-samples`, `--save-all`.*
 
 ---
 
-### 4.2. Huấn luyện Multi-GPU với DDP (Accelerate)
+## 4. Training
 
-#### Cách 1: Sử dụng launcher script `scripts/train_gpus.sh`
+Entry point: `python -m personaplex_finetuning.train`, config via `--config` plus `key=value` overrides.
 
-```bash
-# Huấn luyện 2 GPU trên server với preset full
-bash scripts/train_gpus.sh \
-  gpus=0,1 \
-  data=otospeech \
-  model=server \
-  train=full
-
-# Chạy 4 GPU nhưng giữ global batch bằng 1 GPU × accumulation 8:
-# 1 sample/GPU × 4 GPU × accumulation 2 = 8 samples/update.
-bash scripts/train_gpus.sh \
-  gpus=0,1,2,3 \
-  data=otospeech \
-  model=server \
-  train=full \
-  train.gradient_accumulation_steps=2
-```
-
-**Chi tiết các đối số (arguments dạng key=value đồng nhất):**
-- `gpus=0,1` / `gpus=0,1,2,3`: Danh sách chỉ số GPU vật lý sử dụng. Script tự động thiết lập `CUDA_VISIBLE_DEVICES` và số tiến trình DDP tương ứng.
-- Các preset `data=...`, `model=...`, `train=...` hoặc tham số override khác được chuyển trực tiếp vào chương trình.
-- `train.max_steps` là số optimizer updates; log `global_batch_size` và `samples_per_second` dùng để so sánh throughput.
-
-Preset `otospeech` và `vietnamese` chia mỗi hội thoại thành các cửa sổ liên tiếp 30 giây (chunk cuối được zero-pad), rồi shuffle chunk trong mỗi pass. Sau một pass đầy đủ với speaker LEFT là logical agent, pass kế tiếp dùng speaker RIGHT là logical agent; do đó có hai role views cho mỗi chunk.
-
-Mỗi thư mục mẫu phải có `voice_prompt_left.wav`, `voice_prompt_right.wav`, `metadata.text_prompt_left`, và `metadata.text_prompt_right`. Hai cặp prompt là persona tương ứng của LEFT và RIGHT; training fail-fast trước khi load model nếu thiếu một trường. Không dùng lại voice/text prompt giữa hai speaker.
-
-Để tiếp tục một run bị gián đoạn, giữ nguyên topology DDP và accumulation:
+### 4.1 Single GPU
 
 ```bash
-bash scripts/train_gpus.sh \
-  gpus=4,5,6,7 \
-  data=otospeech \
-  model=server \
-  train=full \
-  train.gradient_accumulation_steps=2 \
-  --resume-from ../runs/full/train_YYYYMMDD_HHMMSS/checkpoints/checkpoint_000500
+# 10-sample overfit
+python -m personaplex_finetuning.train \
+  --config configs/config.yaml \
+  model=local data=otospeech data.prepared_dir=../prepared train=overfit
+
+# full 104h preset
+python -m personaplex_finetuning.train \
+  --config configs/config.yaml \
+  model=local data=otospeech data.prepared_dir=../prepared train=full
 ```
 
-#### Cách 2: Gọi trực tiếp qua lệnh `accelerate launch`
+Standalone (non-Hydra) config without preset groups:
+
+```bash
+python -m personaplex_finetuning.train --config configs/config_example.yaml train.max_steps=5000
+```
+
+### 4.2 Multi-GPU DDP
+
+Launcher script (auto-sets `CUDA_VISIBLE_DEVICES` + process count):
+
+```bash
+# 2 GPUs, full preset
+bash scripts/train_gpus.sh gpus=0,1 train=full model=server data=otospeech
+
+# 4 GPUs, keep global batch = 1 GPU × accumulation:
+bash scripts/train_gpus.sh gpus=0,1,2,3 \
+  config=configs/config.yaml train=full train.gradient_accumulation_steps=2
+```
+
+Direct `accelerate launch`:
 
 ```bash
 accelerate launch \
-  --multi_gpu \
-  --num_processes 2 \
-  --mixed_precision bf16 \
+  --multi_gpu --num_processes 2 --mixed_precision bf16 \
   -m personaplex_finetuning.train \
-  data=otospeech \
-  model=server \
-  train=full
+  --config configs/config.yaml train=full model=server data=otospeech
 ```
 
----
+`train_gpus.sh` consumes `gpus=`, `n=/processes=`, `config=`/`--config`; everything else is passed through to the trainer.
 
-### 4.3. Huấn luyện theo Stage (Stage-Wise Freezing & Dual Learning Rate)
-
-Khi huấn luyện thích nghi ngôn ngữ mới (như tiếng Việt), bạn có thể chia thành các giai đoạn tối ưu hóa từng thành phần:
+### 4.3 Stage-wise training
 
 ```bash
-# --------------------------------------------------------------------------
-# Stage 0: Fine-tune thích nghi Mimi Audio Codec (Nếu kiểm tra ở mục 2.8 < 8 dB)
-# Chỉ cần audio WAV mono (không cần text transcript, không cần alignment)
-# --------------------------------------------------------------------------
+# Stage 0 — adapt the Mimi codec (mono WAVs only, no transcript/alignment)
 bash scripts/train_mimi.sh gpus=0 data_dir=path/to/vietnamese_wavs learning_rate=5e-5 max_steps=5000
+# or directly:
+python -m tools.train_mimi --data-dir path/to/vietnamese_wavs --learning-rate 5e-5 --max-steps 5000
 
-# --------------------------------------------------------------------------
-# Stage 1: Chỉ huấn luyện khối Temporal 7B (Đóng băng 100% Depth Transformer)
-# Thích hợp cho giai đoạn đầu học ngữ nghĩa hội thoại và turn-taking
-# --------------------------------------------------------------------------
-bash scripts/train_gpus.sh gpus=0,1 data=otospeech model=server train=full stage=temporal_only
+# Stage 1 — temporal 7B only (depth transformer 100% frozen)
+bash scripts/train_gpus.sh gpus=0,1 train=full model=server data=otospeech stage=temporal_only
 
-# --------------------------------------------------------------------------
-# Stage 2: Chỉ huấn luyện khối Depth Transformer (Đóng băng 100% Temporal 7B)
-# Thích hợp để tinh chỉnh phát âm âm học và thanh điệu mà không làm lệch tư duy hội thoại
-# --------------------------------------------------------------------------
-bash scripts/train_gpus.sh gpus=0,1 data=otospeech model=server train=full stage=depth_only
+# Stage 2 — depth transformer only (temporal 7B 100% frozen)
+bash scripts/train_gpus.sh gpus=0,1 train=full model=server data=otospeech stage=depth_only
 
-# --------------------------------------------------------------------------
-# Stage 3: Huấn luyện liên hợp (Joint) với 2 Learning Rate riêng biệt
-# Temporal học 2e-5, Depth học chậm hơn ở 5e-6 để bảo vệ chất lượng giọng nói
-# --------------------------------------------------------------------------
-bash scripts/train_gpus.sh gpus=0,1 data=otospeech model=server train=full \
-  stage=joint \
-  learning_rate=2e-5 \
-  depformer_lr=5e-6
+# Stage 3 — joint with dual learning rates
+bash scripts/train_gpus.sh gpus=0,1 train=full model=server data=otospeech \
+  stage=joint learning_rate=2e-5 depformer_lr=5e-6
 ```
+
+### 4.4 Qwen backbone swap
+
+```bash
+# Qwen3-8B (LoRA on q_proj/v_proj)
+python -m personaplex_finetuning.train --config configs/qwen3-8b.yaml
+
+# Qwen3.5-9B (hybrid DeltaNet; LoRA on attn_qkv + ffn_gate/up/down)
+python -m personaplex_finetuning.train --config configs/qwen35-9b.yaml
+```
+
+Or on the master config:
+
+```bash
+python -m personaplex_finetuning.train \
+  --config configs/config.yaml \
+  backbone=qwen qwen_id=Qwen/Qwen3-8B lora=qwen train=qwen
+```
+
+Requirements: `transformers>=4.57`, `torch>=2.6`. LoRA surfaces are auto-detected per family; override with `qwen_targets="q_proj,v_proj,k_proj,o_proj"`. The Qwen path uses three LR groups: `learning_rate` (backbone LoRA), `interface_lr` (depth I/O + adapters), `audio_embed_lr` (audio embedding table when `ft_embed=true`). QLoRA is not supported on the Qwen path.
+
+> 🇻🇳 *Swap backbone không cần đổi code — chỉ đổi config. Qwen path 3 nhóm LR riêng.*
+
+### 4.5 Resume & QLoRA
+
+```bash
+# resume (keep same GPU count and gradient_accumulation_steps)
+bash scripts/train_gpus.sh gpus=4,5,6,7 train=full model=server \
+  train.gradient_accumulation_steps=2 \
+  --resume-from ../runs/full/train_YYYYMMDD_HHMMSS/checkpoints/checkpoint_000500
+
+# 4-bit NF4 quantization (personaplex backbone only)
+python -m personaplex_finetuning.train --config configs/config.yaml \
+  lora=qlora train=overfit --qlora
+```
+
+Checkpoints restore adapter, optimizer, and scheduler; old adapter-only checkpoints still load with a fresh optimizer.
+
+### 4.6 Override reference
+
+The trainer accepts plain `key=value` overrides and maps them to config sections automatically:
+
+| Override | Maps to | Notes |
+| :--- | :--- | :--- |
+| `model=`, `data=`, `train=`, `lora=` | config group | Preset: `local/server/qwen3-8b/qwen35-9b`, `otospeech/vietnamese`, `full/overfit/qwen`, `default/qlora/qwen` |
+| `stage=` | `train.stage` | `joint`, `temporal_only`, `depth_only` |
+| `freeze_depformer=true` / `freeze_tempformer=true` | `train.stage` | Shortcut for `temporal_only` / `depth_only` |
+| `learning_rate=`, `max_steps=`, `output_dir=`, `warmup_steps=`, `eval_every_steps=`, `save_every_steps=`, `gradient_accumulation_steps=`, `gradient_checkpointing=`, `mixed_precision=` | `train.*` | |
+| `depformer_lr=` / `tempformer_lr=` | depth / temporal LR | Dual-LR joint training |
+| `interface_lr=`, `audio_embed_lr=` | `train.*` | Qwen path only |
+| `rank=`, `alpha=`, `qlora=`, `quant_type=` | `lora.*` | |
+| `qwen_rank=`, `qwen_alpha=`, `depformer_rank=`, `depformer_alpha=`, `ft_embed=`, `qwen_targets=` | `lora.*` | |
+| `backbone=`, `qwen_id=`, `device=` | `model.*` | `device=` auto-prefixed to `model.device` |
+| `window_seconds=`, `shuffle=` | `data.*` | |
+| `data.prepared_dir=`, `data.val_manifest=`, `data.val_ratio=`, `data.static_chunking=`, `data.swap_roles_after_pass=`, `data.random_crop=`, `data.prompt_aug_prob=` | `data.*` | dotted overrides pass through to Hydra |
+| `gpus=` / `gpu=` / `devices=` / `device_ids=` | ignored | Only meaningful for `scripts/train_gpus.sh` |
+
+Full key reference for standalone configs: see `configs/config_example.yaml` (documents every parsed key, including loss weights which are hardcoded in `src/personaplex_finetuning/objective.py`).
+
+### 4.7 Outputs
+
+Each run writes `train_YYYYMMDD_HHMMSS/` under `output_dir`:
+
+```
+train_YYYYMMDD_HHMMSS/
+├── checkpoints/checkpoint_NNNNNN/
+│   ├── lora.safetensors        # adapter weights
+│   ├── adapter.json            # rank/alpha/qlora metadata
+│   └── training_state.pt       # optimizer + scheduler state
+├── run.json                    # timing, peak GPU, best val loss, reload checks
+└── tensorboard events
+```
+
+`data` presets `otospeech` / `vietnamese` split conversations into consecutive 30 s windows (last chunk zero-padded), shuffled per pass; with `swap_roles_after_pass` each chunk is trained once with LEFT as agent and once with RIGHT as agent. Every sample dir must contain `voice_prompt_left.wav`, `voice_prompt_right.wav`, `metadata.text_prompt_left`, and `metadata.text_prompt_right`; training fails fast before loading the model if any field is missing. Voice/text prompts are never shared between speakers.
 
 ---
 
-### 4.4. Chạy Interactive Live Demo qua Terminal CLI (Nói chuyện Micro & Loa trực tiếp)
+## 5. Inference
 
-Tương tác đàm thoại 2 chiều thời gian thực (full-duplex) với PersonaPlex qua microphone và loa máy tính. Hỗ trợ trỏ vào base checkpoint cục bộ và nạp adapter LoRA đã fine-tune.
+### 5.1 Terminal CLI (mic ↔ speakers, full-duplex)
 
 ```bash
-# Cách 1: Chạy trực tiếp với file cấu hình demo.yaml (Khuyên dùng)
-python -m tools.interactive_cli \
-  --config configs/demo.yaml
+# recommended: config file
+python -m tools.interactive_cli --config configs/demo.yaml
 
-# Cách 2: Truyền đầy đủ flags hoặc override tham số từ dòng lệnh
+# or full flags
 python -m tools.interactive_cli \
   --model-root ../models \
   --adapter ../runs/hf_overfit_10/checkpoints/checkpoint_000300 \
@@ -364,188 +380,227 @@ python -m tools.interactive_cli \
   --text-prompt "You enjoy having a good conversation. You are a helpful and friendly assistant." \
   --device cuda \
   --save-session-dir outputs/live_session
+
+# launcher
+bash scripts/run_cli_demo.sh --config configs/demo.yaml
 ```
-*(Hoặc sử dụng launcher script: `bash scripts/run_cli_demo.sh --config configs/demo.yaml`)*
 
-**Chi tiết các cờ (flags) và đối số:**
-- `--config` **[Optional]**: Đường dẫn tới file cấu hình YAML/JSON (ví dụ: `configs/demo.yaml`).
-- `--model-root` **[Required nếu không có config]**: Thư mục chứa base model checkpoint cục bộ (`model.safetensors`, `tokenizer-*.safetensors`, `tokenizer_spm_32k_3.model`).
-- `--voice-prompt` **[Required nếu không có config]**: Đường dẫn tới file âm thanh mẫu giọng nói (WAV hoặc `.pt`).
-- `--adapter` **[Optional]**: Thư mục checkpoint LoRA hoặc đường dẫn file `lora.safetensors`. Nếu bỏ cờ này, hệ thống tự động chạy PersonaPlex base nguyên bản.
-- `--text-prompt` **[Optional]**: Câu prompt quy định vai trò/tính cách (chuỗi text hoặc đường dẫn file `.txt`), tự động bọc thẻ `<system> ... <system>`.
-- `--device` **[Optional]**: Thiết bị chạy model (`cuda` hoặc `cpu`, mặc định: `cuda`).
-- `--qlora` **[Optional]**: Bật lượng tử hóa 4-bit NF4 để tiết kiệm VRAM.
-- `--lora-rank`, `--lora-alpha` **[Optional]**: Chỉ định rank/alpha nếu file `adapter.json` không tồn tại.
-- `--greedy` **[Optional]**: Bật greedy decoding thay cho sampling ngẫu nhiên.
-- `--temp`, `--temp-text`, `--top-k`, `--top-k-text` **[Optional]**: Siêu tham số điều khiển tính ngẫu nhiên khi sinh audio/text.
-- `--input-device`, `--output-device` **[Optional]**: ID hoặc tên thiết bị micro/loa cụ thể.
-- `--save-session-dir` **[Optional]**: Thư mục lưu lại bản ghi âm toàn bộ cuộc trò chuyện (`user.wav`, `agent.wav`, `dialogue_stereo.wav` và `transcript.txt`).
-- `--input-wav` **[Optional]**: Chế độ file: nạp file WAV người dùng thay vì dùng micro, model sinh ra file `--output-wav`.
+Key flags:
 
----
+| Flag | Meaning |
+| :--- | :--- |
+| `--config` | YAML/JSON config (see `configs/demo.yaml`) |
+| `--model-root` | Local base checkpoint dir (required without config) |
+| `--adapter` | LoRA checkpoint dir or `lora.safetensors`; omit for base model |
+| `--personaplex-source` | PersonaPlex source root (defaults to bundled `src`) |
+| `--voice-prompt` | Voice sample WAV/`.pt` |
+| `--text-prompt` | Role/system prompt text or `.txt` path (auto-wrapped in `<system>` tags) |
+| `--device` | `cuda` (default) or `cpu` |
+| `--qlora` | 4-bit NF4 for low VRAM |
+| `--lora-rank`, `--lora-alpha` | Needed only if `adapter.json` missing |
+| `--greedy` / `--temp`, `--temp-text`, `--top-k`, `--top-k-text` | Decoding controls |
+| `--input-device`, `--output-device` | Specific mic/speaker ID or name |
+| `--input-wav` / `--output-wav` | File mode instead of microphone |
+| `--save-session-dir` | Record `user.wav`, `agent.wav`, `dialogue_stereo.wav`, `transcript.txt` |
+| `--list-devices` | List audio devices and exit |
 
-### 4.4. Chạy Web UI Demo qua Gradio (Giao diện Web & Link công khai tạm thời gradio.live)
+### 5.2 Gradio web UI (with temporary public link)
 
-Cung cấp giao diện Web trực quan hỗ trợ chọn giọng mẫu (Preset Voice Prompts), tải file giọng tuỳ ý, chọn persona preset (Teacher, Customer Service, Casual Friend), tinh chỉnh siêu tham số, ghi âm từ microphone trình duyệt và phát trực tiếp audio phản hồi + text transcript.
-
-Đặc biệt hỗ trợ **Temporary Public Share Link (`gradio.live`)** giống như TensorBoard giúp truy cập từ xa qua điện thoại/máy tính khác mà vẫn được cấp quyền microphone (nhờ kết nối bảo mật HTTPS).
+Voice-preset dropdown, persona presets, hyperparameter tuning, browser microphone recording, live audio + transcript:
 
 ```bash
-# Cách 1: Khởi động qua file cấu hình demo.yaml (Khuyên dùng)
-python -m tools.interactive_web \
-  --config configs/demo.yaml
+# config file (recommended)
+python -m tools.interactive_web --config configs/demo.yaml
 
-# Cách 2: Chạy trực tiếp qua launcher script
+# launcher
 bash scripts/run_web_demo.sh --config configs/demo.yaml
 
-# Cách 3: Truyền cờ CLI chỉ định checkpoint LoRA & tạo link public
+# with LoRA checkpoint + public share link
 python -m tools.interactive_web \
   --model-root ../models \
   --adapter ../runs/hf_overfit_10/checkpoints/checkpoint_000300 \
-  --share \
-  --port 8998
+  --share --port 8998
 ```
 
-**Chi tiết các cờ (flags) và đối số:**
-- `--config` **[Optional]**: File cấu hình YAML/JSON chứa các thiết lập `model`, `adapter`, `prompt`, `server` (ví dụ: `configs/demo.yaml`).
-- `--model-root` **[Required nếu không có config]**: Thư mục chứa base model checkpoint cục bộ (`model.safetensors`, `tokenizer-*.safetensors`, `tokenizer_spm_32k_3.model`).
-- `--adapter` **[Optional]**: Đường dẫn checkpoint LoRA (`lora.safetensors` hoặc thư mục checkpoint). Nếu bỏ trống, web UI sẽ chạy base model gốc.
-- `--voice-prompt` **[Optional]**: File WAV/PT giọng mẫu mặc định. Giao diện tự động quét `voice_prompt_left.wav` và `voice_prompt_right.wav` trong `prepared/samples/` để đưa vào dropdown.
-- `--text-prompt` **[Optional]**: Prompt vai trò hệ thống mặc định.
-- `--device` **[Optional]**: Thiết bị chạy (`cuda` hoặc `cpu`, mặc định: `cuda`).
-- `--qlora` **[Optional]**: Bật lượng tử hóa 4-bit NF4 để giảm VRAM khi chạy trên GPU yếu.
-- `--host` **[Optional]**: Địa chỉ mạng bind socket (mặc định: `0.0.0.0` để mở cho mạng nội bộ/LAN).
-- `--port` **[Optional]**: Cổng dịch vụ web (mặc định: `8998`).
-- `--share` **[Optional, mặc định bật]**: Tự động tạo temporary public URL dạng `https://xxxx.gradio.live` (có hiệu lực 72h) để truy cập từ ngoài Internet.
-- `--no-share` **[Optional]**: Tắt tính năng tạo link public, chỉ lắng nghe cục bộ trong mạng nội bộ.
+Access: local `http://localhost:8998`, or the temporary `https://xxxxxxxx.gradio.live` URL printed in the terminal (HTTPS, so microphone permission works; valid 72 h). `--no-share` disables the public link. Flags: `--config`, `--model-root`, `--adapter`, `--voice-prompt`, `--text-prompt`, `--device`, `--qlora`, `--host` (default `0.0.0.0`), `--port` (default `8998`), `--share` (default on), `--no-share`.
 
-**Cách truy cập giao diện:**
-- Cục bộ: Mở trình duyệt truy cập `http://localhost:8998`
-- Từ xa (Internet): Sử dụng đường link `https://xxxxxxxx.gradio.live` được in ra trên terminal.
+### 5.3 Inference smoke test (file-based)
 
----
-
-### 4.5. Chạy Thử Nghiệm Suy Luận File (Inference Smoke Test)
-
-Thực hiện nạp lại adapter LoRA trên base model gốc, tái tạo luồng Hybrid System Prompt (Voice prompt + Text prompt) và sinh phản hồi âm thanh/văn bản từ 1 mẫu trong dataset:
+Reloads a trained LoRA adapter, rebuilds the hybrid system prompt, and generates audio/text for one dataset sample:
 
 ```bash
 python -m tools.inference_smoke \
-  --config configs/test_overfit.yaml \
+  --config configs/config_example.yaml \
   --adapter runs/hf_overfit_10/checkpoints/checkpoint_000300/lora.safetensors \
   --index 0 \
   --start 42.5 \
   --output-dir outputs/smoke
 ```
 
-**Chi tiết các đối số (arguments):**
-- `--config` **[Required]**: File cấu hình chứa đường dẫn base checkpoint (`model.root`) và source code PersonaPlex.
-- `--adapter` **[Required]**: Đường dẫn tới file trọng số LoRA đã huấn luyện (`lora.safetensors` hoặc thư mục checkpoint).
-- `--index` **[Optional]**: Index của mẫu hội thoại trong dataset dùng làm ngữ cảnh giọng nói, prompt và input user (mặc định: `0`).
-- `--start` **[Optional]**: Mốc thời gian theo giây trong `conversation.wav`. Khi đặt, inference dùng đúng một cửa sổ `data.window_seconds` (thường 30 giây) từ mốc này; chọn đoạn có user speech để tránh input im lặng. Lệnh sẽ từ chối cửa sổ vượt cuối audio.
-- `--output-dir` **[Optional]**: Thư mục lưu kết quả sinh (mặc định: `outputs/smoke`).
+Flags: `--config` (required), `--adapter` (required), `--index` (default `0`), `--start` (window start in seconds; must stay within the audio), `--input-path`/`--input-file` (optional external WAV/MP3 instead of sample audio), `--output-dir` (default `outputs/smoke`).
 
-Thư mục kết quả có `dialogue_original.wav` (hội thoại nguồn, cắt theo đúng cửa sổ inference; giữ nguyên thứ tự kênh), `user.wav`, audio/text do base model sinh và audio/text do adapter sinh. `finetuned.txt` có thể rỗng nếu lúc sinh tự do mô hình không phát token text hợp lệ; loss train giảm đo khả năng dự đoán target khi có ngữ cảnh teacher-forced, không đảm bảo đầu ra greedy lúc inference sẽ chép lại transcript train.
+Outputs: `dialogue_original.wav` (source dialogue cropped to the inference window), `user.wav`, and base-model vs adapter-generated audio/text. `finetuned.txt` may be empty when free generation produces no valid text tokens — training loss measures teacher-forced prediction, not greedy inference transcripts.
 
 ---
 
-## 5. Giám Sát Quá Trình Huấn Luyện (TensorBoard)
-
-Khởi động giao diện trực quan hóa loss (`loss/total`, `loss/text`, `loss/audio_semantic`, `loss/audio_nonsemantic`), gradient norm và GPU memory:
+## 6. Monitoring (TensorBoard)
 
 ```bash
-tensorboard \
-  --logdir runs/hf_overfit_10 \
-  --host 0.0.0.0 \
-  --port 6006
+tensorboard --logdir runs/hf_overfit_10 --host 0.0.0.0 --port 6006
 ```
 
-**Chi tiết các đối số (arguments):**
-- `--logdir` **[Required]**: Thư mục chứa log sự kiện huấn luyện (event logs).
-- `--host` **[Optional]**: Địa chỉ IP bind socket (`0.0.0.0` để cho phép truy cập từ xa qua mạng).
-- `--port` **[Optional]**: Cổng mở giao diện web (mặc định: `6006`).
+Scalars: `loss/total`, `loss/text`, `loss/audio_semantic`, `loss/audio_nonsemantic`, gradient norm, LR, `samples_per_second`, GPU memory. Validation losses (`val/*`) when `eval_every_steps > 0`.
 
 ---
 
-## 6. Đánh Giá Khả Năng Hội Thoại Song Công (Full-Duplex-Bench)
+## 7. Full-Duplex-Bench
 
-Hệ thống đánh giá tự động dựa trên chuẩn của **Full-Duplex-Bench (FDB v1.0 & v1.5)** để đo lường 4 trục tương tác cốt lõi:
-1. **Pause Handling**: Khả năng kiên nhẫn, không cướp lời khi người dùng ngập ngừng/nghỉ giữa câu (**TOR ↓**).
-2. **Backchanneling**: Khả năng chèn âm đệm ngắn tự nhiên khi người dùng nói dài (**TOR ↓, Freq ↑, JSD ↓**).
-3. **Smooth Turn-Taking**: Tốc độ và độ nhạy bắt lời khi người dùng dứt câu (**TOR ↑, Latency ↓**).
-4. **User Interruption**: Xử lý nhường microphone và trả lời nội dung mới khi bị chen ngang (**TOR ↑, Response Quality ↑, Latency ↓**).
+Offline benchmark implementing the Full-Duplex-Bench (FDB v1.0) protocol on the native 12.5 Hz frame-token stream — no external ASR model required. Four axes:
 
-> **Điểm ưu việt**: Tận dụng trực tiếp luồng native 12.5 Hz frame tokens của PersonaPlex và mốc thời gian có sẵn từ data preparation; **hoàn toàn offline, không cần cài đặt thêm mô hình ASR cồng kềnh**.
+1. **Pause Handling** — patience during user hesitation (TOR ↓)
+2. **Backchanneling** — natural short backchannels during long user turns (TOR ↓, Freq ↑, JSD ↓)
+3. **Smooth Turn-Taking** — response speed after user stop (TOR ↑, Latency ↓)
+4. **User Interruption** — yields and answers new content when interrupted (TOR ↑, Response Quality ↑, Latency ↓)
 
-### 6.1. Chạy Thử Nghiệm Mock / So Sánh Nhanh (Dry-run Demo)
-In bảng đối sánh mô phỏng giữa Base model và LoRA model dạng Rich Table trên Terminal:
+> 🇻🇳 *Benchmark offline, không cần ASR, chấm 4 trục song công theo chuẩn FDB v1.0.*
+
+### 7.1 Quick compare demo (Base vs LoRA)
+
 ```bash
-python ../run_fdp_benchmark.py --compare_demo
+python -c "from personaplex_benchmark.cli import run_benchmark_cli; raise SystemExit(run_benchmark_cli())" \
+  --compare_demo
 ```
 
-### 6.2. Chạy Benchmark Thật Trên Checkpoint PersonaPlex Base
-Đánh giá trên tập dữ liệu chuẩn Full-Duplex-Bench v1.0 (727 mẫu tiếng Anh) để đối chuẩn với Table 2 của paper:
+*(The benchmark package has no `__main__` entry yet; the one-liner above is the current way to invoke it.)*
+
+### 7.2 Benchmark on base checkpoint
 
 ```bash
-# Chạy trên GPU / Linux CUDA:
-python ../run_fdp_benchmark.py \
+# Linux CUDA
+python -c "from personaplex_benchmark.cli import run_benchmark_cli; raise SystemExit(run_benchmark_cli())" \
   --model_root ../models \
   --model_name "PersonaPlex Base" \
-  --fdb_dir ../benchmarks/datasets/fdb_v1/v1.0/extracted \
+  --fdb_dir benchmarks/datasets/fdb_v1/v1.0/extracted \
   --max_samples_per_task 10 \
-  --output_dir ../benchmarks/results_fdb
+  --output_dir benchmarks/results_fdb
 
-# Chạy trên macOS Apple Silicon (MPS):
-PYTORCH_ENABLE_MPS_FALLBACK=1 python ../run_fdp_benchmark.py \
+# macOS Apple Silicon
+PYTORCH_ENABLE_MPS_FALLBACK=1 python -c "from personaplex_benchmark.cli import run_benchmark_cli; raise SystemExit(run_benchmark_cli())" \
   --model_root ../models \
   --model_name "PersonaPlex Base" \
-  --fdb_dir ../benchmarks/datasets/fdb_v1/v1.0/extracted \
+  --fdb_dir benchmarks/datasets/fdb_v1/v1.0/extracted \
   --max_samples_per_task 10 \
-  --output_dir ../benchmarks/results_fdb
+  --device mps \
+  --output_dir benchmarks/results_fdb
 ```
 
-### 6.3. Chạy Benchmark Đánh Giá Checkpoint LoRA (Sau Khi Fine-tune)
-Kiểm tra xem mô hình sau fine-tune có bảo toàn hoặc cải thiện năng lực full-duplex hay không:
+### 7.3 Benchmark a fine-tuned LoRA checkpoint
 
 ```bash
-python ../run_fdp_benchmark.py \
+python -c "from personaplex_benchmark.cli import run_benchmark_cli; raise SystemExit(run_benchmark_cli())" \
   --model_root ../models \
   --adapter ../checkpoints/lora_adapter.pt \
   --model_name "PersonaPlex LoRA" \
-  --fdb_dir ../benchmarks/datasets/fdb_v1/v1.0/extracted \
+  --fdb_dir benchmarks/datasets/fdb_v1/v1.0/extracted \
   --max_samples_per_task 10 \
-  --output_dir ../benchmarks/results_fdb
+  --output_dir benchmarks/results_fdb
 ```
 
-### 6.4. Chạy Benchmark Trên Dữ Liệu In-Domain / Tiếng Việt (Tương Lai)
-Khi có tập dữ liệu hội thoại tiếng Việt (hoặc tập OtoSpeech trong `prepared/samples`):
+### 7.4 In-domain / prepared-data benchmark
+
 ```bash
-python ../run_fdp_benchmark.py \
+python -c "from personaplex_benchmark.cli import run_benchmark_cli; raise SystemExit(run_benchmark_cli())" \
   --model_root ../models \
   --adapter ../checkpoints/lora_adapter.pt \
   --model_name "PersonaPlex-VI LoRA" \
   --prepared_dir ../prepared/samples \
   --max_samples_per_task 10 \
-  --output_dir ../benchmarks/results_vi
+  --output_dir benchmarks/results_vi
 ```
 
-### 6.5. Bảng Giải Thích Các Tham Số (Arguments)
+### 7.5 Arguments
 
-| Tham số CLI | Mặc định | Ý nghĩa |
+| Argument | Default | Meaning |
 | :--- | :--- | :--- |
-| `--model_root` | `models` | Đường dẫn thư mục chứa base model (`model.safetensors`, tokenizer, mimi). |
-| `--adapter` | `None` | Đường dẫn file trọng số LoRA (`lora.safetensors` hoặc `.pt`). Nếu bỏ trống, chạy base model gốc. |
-| `--model_name` | `PersonaPlex Base` | Tên mô hình hiển thị trên bảng kết quả. |
-| `--fdb_dir` | `benchmarks/datasets/fdb_v1/v1.0/extracted` | Thư mục chứa dataset chuẩn Full-Duplex-Bench v1.0. |
-| `--prepared_dir` | `None` | Thư mục chứa các mẫu hội thoại tự chuẩn bị (`words.json`, `conversation.wav`). |
-| `--max_samples_per_task` | `10` | Số lượng mẫu tối đa đánh giá cho mỗi nhóm tác vụ (giúp chạy nhanh hoặc toàn diện). |
-| `--device` | `auto` | Thiết bị tính toán: `auto`, `cuda`, `mps`, hoặc `cpu`. |
-| `--output_dir` | `benchmarks/results` | Thư mục lưu bảng báo cáo Markdown và JSON. |
-| `--mock` | `False` | Bật chế độ chạy giả lập nhanh (dry-run). |
-| `--compare_demo` | `False` | Chạy demo so sánh trực quan Base vs LoRA trên Terminal. |
+| `--model_root` | `models` | Base checkpoint dir |
+| `--adapter` | `None` | LoRA weights (`lora.safetensors` or `.pt`); omit for base model |
+| `--model_name` | `PersonaPlex Base` | Display name in report |
+| `--fdb_dir` | `benchmarks/datasets/fdb_v1/v1.0/extracted` | Official FDB v1.0 dataset |
+| `--prepared_dir` | `None` | Your prepared conversations (`words.json`, `conversation.wav`) |
+| `--voice_prompt` | `prepared/samples/conv_0001/voice_prompt_left.wav` | Default voice prompt |
+| `--gt_dist` | `benchmarks/datasets/fdb_v1/icc_gt_distribution.json` | ICC ground-truth distribution |
+| `--output_dir` | `benchmarks/results` | Report destination |
+| `--max_samples_per_task` | `10` | Samples per task group |
+| `--device` | `auto` | `auto`, `cuda`, `mps`, or `cpu` |
+| `--mock` | off | Dry-run with a mock runner |
+| `--compare_demo` | off | Base-vs-LoRA side-by-side demo |
 
-### 6.6. File Kết Quả Đầu Ra
-Kết quả sau khi chạy được tự động:
-1. In bảng Rich Table màu sắc trực quan ngay trên Terminal.
-2. Xuất bảng Markdown: `{output_dir}/fdp-benchmark-result.md`.
-3. Xuất file JSON chi tiết: `{output_dir}/fdp-benchmark-result.json`.
+### 7.6 Output
+
+1. Colored Rich table in the terminal.
+2. `{output_dir}/fdp-benchmark-result.md`
+3. `{output_dir}/fdp-benchmark-result.json`
+
+---
+
+## 8. Repository Layout
+
+```
+personaplex-finetune-v2/
+├── configs/                  # Hydra configs
+│   ├── config.yaml           # master (model/data/lora/train groups)
+│   ├── config_example.yaml   # standalone fully-commented config
+│   ├── demo.yaml             # CLI/Web demo config
+│   ├── qwen3-8b.yaml         # Qwen3-8B backbone swap master
+│   ├── qwen35-9b.yaml        # Qwen3.5-9B backbone swap master
+│   ├── model/  data/  lora/  train/   # preset groups
+├── scripts/                  # launchers & setup
+│   ├── setup_server_env.sh / setup_hf_server_env.sh
+│   ├── download_hf_assets.sh
+│   ├── train_gpus.sh  train_mimi.sh  train_overfit.sh
+│   └── run_cli_demo.sh  run_web_demo.sh
+├── src/
+│   ├── moshi/                # vendored Moshi implementation
+│   ├── personaplex_finetuning/   # config, data, LoRA, runtime, train, FSDP helpers
+│   ├── personaplex_benchmark/    # Full-Duplex-Bench runner + metrics
+│   └── tools/                # CLI tools (validate, inspect, demo, mimi, download)
+├── tests/                    # unit test suite
+├── pyproject.toml            # package: personaplex-finetuning
+├── requirements.txt
+├── environment.yml / environment.hf.yml
+└── THIRD_PARTY_NOTICES.md
+```
+
+### Tools index
+
+| Tool | Purpose |
+| :--- | :--- |
+| `tools.validate_dataset` | Validate prepared dataset structure |
+| `tools.inspect_sample` | Inspect one sample's frame/loss-mask layout |
+| `tools.train_smoke` | 1-step train smoke test shortcut |
+| `tools.train_mimi` | Stage 0 Mimi codec fine-tuning |
+| `tools.test_mimi` | Mimi encode→decode fidelity (SI-SDR/SNR) |
+| `tools.compare_mimi_asr` | ASR comparison original vs Mimi-reconstructed audio |
+| `tools.interactive_cli` | Terminal live duplex demo |
+| `tools.interactive_web` | Gradio web demo |
+| `tools.inference_smoke` | File-based LoRA inference check |
+| `tools.download_hf_assets` | Download model + dataset from HF |
+| `tools.publish_prepared` | Publish prepared dataset to HF |
+
+### Tests
+
+```bash
+python -m unittest discover tests
+```
+
+Covers LoRA adapter resolution/loading, config parsing, objective loss weights, session frame stepping, sequence overflow, FSDP policies, Qwen backbones/tokenizer, benchmark metrics & runner, and the end-to-end pipeline smoke test.
+
+---
+
+## Notes
+
+- **Loss weights** (`nonsemantic_audio_weight: 0.02`, `text_padding_weight: 0.3`, codebook 0 weight 1.0, user stream weight 0, system-prompt region masked) are hardcoded in `src/personaplex_finetuning/objective.py`, not configurable via YAML.
+- **`configs/config.yaml`** currently references `train: 104h`; the available train presets are `full`, `overfit`, `qwen`. Edit the master config or override with `train=full` on the command line.
+- QLoRA (`--qlora`, `lora.qlora: true`) applies to the PersonaPlex backbone only.
+- Data presets in `configs/data/*.yaml` point at server paths — override with `data.prepared_dir=<your path>` for local runs.
+- See `THIRD_PARTY_NOTICES.md` for bundled component licenses.

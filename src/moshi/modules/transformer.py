@@ -193,6 +193,8 @@ def multi_linear(
     ys = []
     chout, chin = weight.shape
     weight = weight.view(num_linear, -1, chin)
+    if weight.dtype != x.dtype:
+        weight = weight.to(x.dtype)
     for t in range(T):
         y = F.linear(x[:, t], weight[t + offset])
         ys.append(y)
@@ -262,6 +264,8 @@ class RingKVCache:
 
     def complete(self, k: torch.Tensor, v: torch.Tensor) -> KVCacheResult:
         assert k.shape[:-1] == v.shape[:-1], (k.shape, v.shape)
+        if k.dtype != self.cache.dtype:
+            self.cache = self.cache.to(k.dtype)
         B, H, T, D = k.shape
         indexes = torch.arange(T, device=self.end_offset.device, dtype=self.end_offset.dtype) + self.end_offset
         indexes = indexes % self.capacity

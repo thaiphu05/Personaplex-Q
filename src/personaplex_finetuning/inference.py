@@ -5,7 +5,6 @@ from __future__ import annotations
 import contextlib
 import json
 import logging
-import os
 from dataclasses import replace
 from pathlib import Path
 
@@ -96,11 +95,10 @@ def generate(
     model.eval()
     cache_streaming = config.backbone == "qwen"
     if cache_streaming:
-        # A growing KV cache cannot be replayed by CUDA graphs.
-        os.environ.setdefault("NO_CUDA_GRAPH", "1")
         model.start_streaming_caches()
     gen = gen_cfg or {}
     lm_module = importlib.import_module("moshi.models.lm")
+    compile_module = importlib.import_module("moshi.utils.compile")
     generator = lm_module.LMGen(
         model, audio_silence_frame_cnt=int(gen.get("audio_silence_frame_cnt", 6)),
         sample_rate=runtime.codec.sample_rate, frame_rate=runtime.codec.frame_rate,
@@ -116,13 +114,17 @@ def generate(
     text_token_ids: list[int] = []
     # Mimi's decoder is causal/streaming: resetting it for every 80 ms frame
     # inserts boundary transients that sound like clicks and clipped syllables.
-    # autocast bf16 mirrors the training loop: some depformer weights are fp32.
-    if str(config.device).startswith("cuda") and torch.cuda.is_available():
-        autocast = torch.autocast("cuda", dtype=torch.bfloat16)
+    # Autocast mirrors the training loop: some depformer weights are fp32.
+    precision = str(getattr(config, "mixed_precision", "bf16")).lower()
+    if str(config.device).startswith("cuda") and torch.cuda.is_available() and precision in ("bf16", "fp16"):
+        autocast = torch.autocast("cuda", dtype=torch.bfloat16 if precision == "bf16" else torch.float16)
     else:
         autocast = contextlib.nullcontext()
+    # A growing KV cache cannot be replayed by CUDA graphs; scope the
+    # disable to generation so later calls keep their graphs.
+    graph_guard = compile_module.no_cuda_graph() if cache_streaming else contextlib.nullcontext()
     try:
-        with torch.no_grad(), autocast, runtime.codec.mimi.streaming(1), generator.streaming(1):
+        with torch.no_grad(), autocast, graph_guard, runtime.codec.mimi.streaming(1), generator.streaming(1):
             generator.step_system_prompts(runtime.codec.mimi)
             for frame in range(user.shape[-1]):
                 tokens = generator.step(input_tokens=user[:, :, frame : frame + 1])

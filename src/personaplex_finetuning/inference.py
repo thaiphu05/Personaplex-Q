@@ -133,7 +133,9 @@ def generate(
                 decoded = runtime.codec.mimi.decode(tokens[:, 1:9]).squeeze().detach().float().cpu().numpy()
                 pcm_frames.append(decoded)
                 token = int(tokens[0, 0, 0])
-                if token not in (0, runtime.tokenizer.padding_id):
+                # Drop filler ids: 0, text padding, and word-boundary end padding
+                # (Qwen's end padding is <|im_end|>, a visible vocab token).
+                if token not in (0, runtime.tokenizer.padding_id, runtime.tokenizer.end_padding_id):
                     text_token_ids.append(token)
     finally:
         if cache_streaming:

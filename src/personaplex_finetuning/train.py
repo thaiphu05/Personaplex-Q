@@ -403,6 +403,7 @@ def run(
     config: Config,
     smoke: bool = False,
     resume_from: str | None = None,
+    reset_scheduler: bool = False,
 ) -> Path | None:
     for variable in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
         os.environ[variable] = "1"
@@ -629,6 +630,7 @@ def run(
             print(f"Using Dual Learning Rates -> Temporal Transformer: {temp_lr:.2e}, Depth Transformer: {dep_lr:.2e}")
     else:
         optimizer = torch.optim.AdamW(trainable, lr=temp_lr, weight_decay=0.0)
+    base_lrs = [group["lr"] for group in optimizer.param_groups]
     max_steps = 1 if smoke else config.max_steps
     scheduler = None
     if config.warmup_steps > 0 and not smoke:
@@ -654,6 +656,16 @@ def run(
                 print(f"Restored optimizer and scheduler state at optimizer step {start_step}")
         elif accelerator.is_main_process:
             print("Resume checkpoint has no training_state.pt; resuming adapter weights with a fresh optimizer.")
+    if reset_scheduler and resume_checkpoint_dir is not None:
+        if len(optimizer.param_groups) != len(base_lrs):
+            raise RuntimeError("reset-scheduler needs the same optimizer group count as the checkpoint run")
+        for group, lr in zip(optimizer.param_groups, base_lrs):
+            group["lr"] = lr
+        inner = getattr(scheduler, "scheduler", scheduler)
+        if inner is not None:
+            inner.last_epoch = -1
+        if accelerator.is_main_process:
+            print(f"Reset LR schedule from config (base LRs {[f'{v:.1e}' for v in base_lrs]}); data continues at step {start_step}")
     if start_step > max_steps:
         raise RuntimeError(f"resume checkpoint step {start_step} exceeds train.max_steps={max_steps}")
 
@@ -871,6 +883,7 @@ def main() -> int:
     parser.add_argument("--qlora", action="store_true", default=None, help="Enable 4-bit QLoRA")
     parser.add_argument("--no-qlora", dest="qlora", action="store_false", help="Disable QLoRA")
     parser.add_argument("--resume-from", type=str, default=None, help="Path to checkpoint directory to resume from")
+    parser.add_argument("--reset-scheduler", action="store_true", help="Restart the LR schedule from config values when resuming (keeps weights and data position)")
 
     args, unknown = parser.parse_known_args()
     overrides = [arg for arg in unknown if "=" in arg]
@@ -890,6 +903,7 @@ def main() -> int:
         config,
         smoke=args.smoke,
         resume_from=args.resume_from,
+        reset_scheduler=args.reset_scheduler,
     )
     return 0
 

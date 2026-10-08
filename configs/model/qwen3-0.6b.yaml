@@ -1,0 +1,6 @@
+# Qwen3-0.6B backbone (classic GQA attention; LoRA auto on q_proj + v_proj)
+root: /home/voice/data/voice/personaplex-7b-v1
+source: ../src
+device: cuda
+backbone: qwen
+qwen_id: Qwen/Qwen3-0.6B

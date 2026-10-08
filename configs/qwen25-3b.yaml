@@ -1,0 +1,48 @@
+# Master Hydra configuration: Qwen2.5-3B backbone swap
+# Run: python -m personaplex_finetuning.train --config configs/qwen25-3b.yaml
+# Smoke first: add --smoke data.shuffle=false
+defaults:
+  - model: qwen25-3b
+  - data: vietnamese
+  - lora: qwen
+  - train: qwen
+  - _self_
+
+seed: 42
+
+model:
+  root: /home/voice/data/voice/personaplex-7b-v1   # PersonaPlex-7B checkpoint dir (Mimi codec + depformer graft)
+
+data:
+  prepared_dir: /home/voice/data/voice/vdt/data_ready/synthetic_500h
+  window_seconds: 100
+  shuffle: true
+  random_crop: false
+  prompt_aug_prob: 0.0
+  static_chunking: false
+  swap_roles_after_pass: false
+  val_ratio: 0.05
+
+train:
+  output_dir: ../runs/qwen25-3b
+  max_steps: 20000
+  learning_rate: 2.0e-5            # Qwen backbone LoRA
+  depformer_learning_rate: 5.0e-5  # depth LoRA
+  interface_lr: 5.0e-5
+  audio_embed_lr: 1.0e-4
+  gradient_accumulation_steps: 8
+  warmup_steps: 100
+  eval_every_steps: 500
+  save_every_steps: 1000
+  gradient_checkpointing: false
+  mixed_precision: bf16
+  infer_every_steps: 1000
+  infer_samples: 2
+
+generation:
+  use_sampling: true
+  temp: 0.8
+  temp_text: 0.7
+  top_k: 250
+  top_k_text: 25
+  audio_silence_frame_cnt: 6

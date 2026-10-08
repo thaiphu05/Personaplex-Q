@@ -265,6 +265,26 @@ def load_qwen_runtime(paths: QwenRuntimePaths, device: str = "cuda") -> PersonaP
     end_padding = int(tokenizer.eos_token_id)
     text_initial = int(pad)
 
+    # Backbone hidden size varies (Qwen3-8B: 4096, Qwen3-4B: 2560,
+    # Qwen2.5-3B: 2048, Qwen3-0.6B: 1024); never assume the default.
+    hidden_size = getattr(qwen.config, "hidden_size", None)
+    if hidden_size is None:
+        hidden_size = getattr(getattr(qwen.config, "text_config", None), "hidden_size", None)
+    if hidden_size is None:
+        raise RuntimeError("cannot determine backbone hidden size from the Qwen config")
+    hidden_size = int(hidden_size)
+
+    # depformer_in is grafted for the 4096-dim path; rebuild it fresh when the
+    # backbone hidden size differs so old 8B checkpoints stay compatible.
+    if int(depformer_in[0].in_features) != hidden_size:
+        depformer_width = int(depformer_in[0].out_features)
+        depformer_in = torch.nn.ModuleList(
+            [
+                torch.nn.Linear(hidden_size, depformer_width, bias=False, device=device, dtype=lm_dtype)
+                for _ in range(len(depformer_in))
+            ]
+        )
+
     # 3. Assemble the wrapper.
     from .qwen_lm import QwenMoshiLM
     from .qwen_tokenizer import QwenTokenizer
@@ -274,6 +294,7 @@ def load_qwen_runtime(paths: QwenRuntimePaths, device: str = "cuda") -> PersonaP
         card=card,
         n_q=n_q,
         dep_q=dep_q,
+        dim=hidden_size,
         delays=delays,
         text_padding_token_id=text_initial,
         end_of_text_padding_id=end_padding,

@@ -2,8 +2,8 @@
 
 Two Qwen generations are supported behind one entry point:
 
-- ``qwen3`` (Qwen3-8B): classic GQA decoder — LoRA on ``q_proj``/``v_proj``
-  of all 36 layers.
+- ``qwen2`` (Qwen2.5-3B/7B): classic GQA decoder — LoRA on ``q_proj``/``v_proj``.
+- ``qwen3`` (Qwen3-0.6B/4B/8B): classic GQA decoder — LoRA on ``q_proj``/``v_proj``.
 - ``qwen3_5`` (Qwen3.5-9B): 3:1 hybrid (24 Gated DeltaNet + 8 Gated
   Attention) whose q/k/v/gate projection is a single fused ``attn_qkv``
   Linear — LoRA on ``attn_qkv`` (8 layers) + ``ffn_gate``/``ffn_up``/
@@ -36,6 +36,7 @@ class QwenSpec:
 
 
 QWEN_SPECS: dict[str, QwenSpec] = {
+    "qwen2": QwenSpec("qwen2", ("q_proj", "v_proj")),
     "qwen3": QwenSpec("qwen3", ("q_proj", "v_proj")),
     "qwen3_5": QwenSpec("qwen3_5", ("attn_qkv", "ffn_gate", "ffn_up", "ffn_down")),
 }

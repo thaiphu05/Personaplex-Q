@@ -35,10 +35,10 @@ data:
 train:
   output_dir: ../runs/qwen3-8B
   max_steps: 20000
-  learning_rate: 1.0e-5            # Qwen backbone LoRA
+  learning_rate: 2.0e-5            # Qwen backbone LoRA (tăng từ 1e-5: text lì)
   interface_lr: 5.0e-5             # depth I/O + adapters
   audio_embed_lr: 1.0e-4           # emb table (chỉ khi ft_embed=true)
-  depformer_learning_rate: 5.0e-6  # depth LoRA; bỏ trống = dùng interface_lr
+  depformer_learning_rate: 5.0e-5  # depth LoRA (trả về mức ban đầu: audio vô nghĩa ở 5e-6)
   gradient_accumulation_steps: 8   # global batch = 1 × nGPU × 8
   warmup_steps: 100
   eval_every_steps: 500

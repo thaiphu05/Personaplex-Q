@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
@@ -18,12 +19,25 @@ logger = logging.getLogger(__name__)
 
 
 def _adapter_file(adapter: Path) -> Path:
-    """Resolve a LoRA checkpoint directory to its weights file."""
+    """Resolve a LoRA checkpoint directory to its weights file.
+
+    Accepts the weights file, a ``checkpoint_NNNNNN`` directory, or a
+    ``checkpoints`` parent directory (latest checkpoint wins).
+    """
     path = Path(adapter)
-    if path.is_dir():
-        candidate = path / "lora.safetensors"
-        return candidate if candidate.is_file() else path
-    return path
+    if not path.is_dir():
+        return path
+    candidate = path / "lora.safetensors"
+    if candidate.is_file():
+        return candidate
+    checkpoints = sorted(
+        item for item in path.glob("checkpoint_*") if (item / "lora.safetensors").is_file()
+    )
+    if checkpoints:
+        return checkpoints[-1] / "lora.safetensors"
+    raise FileNotFoundError(
+        f"no lora.safetensors under {path}; pass a checkpoint_NNNNNN directory or the weights file"
+    )
 
 
 def _prepare_input_audio(input_file: Path, output_dir: Path) -> Path:
@@ -102,8 +116,13 @@ def generate(
     text_token_ids: list[int] = []
     # Mimi's decoder is causal/streaming: resetting it for every 80 ms frame
     # inserts boundary transients that sound like clicks and clipped syllables.
+    # autocast bf16 mirrors the training loop: some depformer weights are fp32.
+    if str(config.device).startswith("cuda") and torch.cuda.is_available():
+        autocast = torch.autocast("cuda", dtype=torch.bfloat16)
+    else:
+        autocast = contextlib.nullcontext()
     try:
-        with torch.no_grad(), runtime.codec.mimi.streaming(1), generator.streaming(1):
+        with torch.no_grad(), autocast, runtime.codec.mimi.streaming(1), generator.streaming(1):
             generator.step_system_prompts(runtime.codec.mimi)
             for frame in range(user.shape[-1]):
                 tokens = generator.step(input_tokens=user[:, :, frame : frame + 1])

@@ -13,6 +13,7 @@ from .data import PreparedSample
 from .lora import inject_lora, load_adapter
 from .peft_adapter import configure_qwen_trainable, inject_depformer_lora, inject_qwen_lora, load_qwen_adapter
 from .runtime import QwenRuntimePaths, RuntimePaths, load_qwen_runtime, load_runtime
+from .text_normalization import encode_system_prompt
 
 logger = logging.getLogger(__name__)
 
@@ -107,7 +108,7 @@ def generate(
         top_k=int(gen.get("top_k", 250)), top_k_text=int(gen.get("top_k_text", 25)),
     )
     generator.load_voice_prompt(str(sample.voice_prompt_wav))
-    generator.text_prompt_tokens = runtime.tokenizer.encode(f"<system> {sample.text_prompt.strip()} <system>")
+    generator.text_prompt_tokens = encode_system_prompt(runtime.tokenizer, sample.text_prompt, config.text_prompt_template)
     user_codes = runtime.codec.encode_conversation(sample.conversation_wav, sample.user_channel, sample.window_start_sec, sample.window_end_sec)
     user = torch.tensor(user_codes, device=config.device).unsqueeze(0)
     pcm_frames: list[np.ndarray] = []

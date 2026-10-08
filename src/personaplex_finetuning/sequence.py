@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Protocol, Sequence
 
 from .data import PreparedSample
+from .text_normalization import encode_system_prompt
 
 
 class Codec(Protocol):
@@ -69,11 +70,12 @@ class PersonaPlexTrainingExampleBuilder:
 
     pause_frames = 6
 
-    def __init__(self, codec: Codec, tokenizer: Tokenizer, initial_tokens: Sequence[int], zero_token: int) -> None:
+    def __init__(self, codec: Codec, tokenizer: Tokenizer, initial_tokens: Sequence[int], zero_token: int, text_prompt_template: str = "native") -> None:
         self.codec = codec
         self.tokenizer = tokenizer
         self.initial_tokens = tuple(initial_tokens)
         self.zero_token = zero_token
+        self.text_prompt_template = text_prompt_template
         if codec.codebooks != 8 or len(self.initial_tokens) != 17:
             raise ValueError("PersonaPlex requires 8 codebooks per speaker and 17 initial tokens")
 
@@ -94,7 +96,7 @@ class PersonaPlexTrainingExampleBuilder:
         if dialogue_frames == 0 or len(user[0]) != dialogue_frames:
             raise ValueError(f"{sample.sample_id}: agent/user Mimi frame counts differ or are empty")
         voice_frames = len(voice[0])
-        text_prompt = tuple(self.tokenizer.encode(f"<system> {sample.text_prompt.strip()} <system>"))
+        text_prompt = tuple(encode_system_prompt(self.tokenizer, sample.text_prompt, self.text_prompt_template))
         if not text_prompt:
             raise ValueError(f"{sample.sample_id}: text prompt tokenized to no tokens")
 

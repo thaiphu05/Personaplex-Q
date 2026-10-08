@@ -65,3 +65,12 @@ generation:
   top_k: 250                       # audio top-k
   top_k_text: 25                   # text top-k
   audio_silence_frame_cnt: 6
+
+# Loss objective (native contract)
+first_codebook_weight_multiplier: 1.0   # semantic codebook (CB0) weight
+text_padding_weight: 0.3                # PAD weight; EPAD tùy epad_as_padding
+epad_as_padding: false                  # true = EPAD (word onset) xuống 0.3 như PAD
+user_loss: false                        # true = supervise cả user audio streams
+
+# Prompt template: auto = qwen nếu backbone qwen, native nếu PersonaPlex
+text_prompt_template: auto

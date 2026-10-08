@@ -55,6 +55,11 @@ class Config:
     infer_every_steps: int = 0
     infer_samples: int = 2
     generation: dict[str, Any] = dataclasses.field(default_factory=dict)
+    first_codebook_weight_multiplier: float = 1.0
+    text_padding_weight: float = 0.3
+    epad_as_padding: bool = True
+    user_loss: bool = False
+    text_prompt_template: str = "native"
 
     @property
     def manifest(self) -> Path:
@@ -193,6 +198,24 @@ def load_config(path: str | Path, overrides: list[str] | None = None) -> Config:
     if backbone == "qwen" and not qwen_model_id:
         raise ValueError("model.backbone=qwen requires model.qwen_id (Hugging Face id or local path)")
 
+    first_codebook_weight_multiplier = float(raw.get("first_codebook_weight_multiplier", 1.0))
+    if first_codebook_weight_multiplier < 0:
+        raise ValueError("first_codebook_weight_multiplier must be non-negative")
+    text_padding_weight = float(raw.get("text_padding_weight", 0.3))
+    if not 0 <= text_padding_weight <= 1:
+        raise ValueError("text_padding_weight must be within [0, 1]")
+    epad_as_padding = raw.get("epad_as_padding", False)
+    if not isinstance(epad_as_padding, bool):
+        raise ValueError("epad_as_padding must be a boolean")
+    user_loss = raw.get("user_loss", False)
+    if not isinstance(user_loss, bool):
+        raise ValueError("user_loss must be a boolean")
+    text_prompt_template = str(raw.get("text_prompt_template", "auto")).lower()
+    if text_prompt_template not in {"auto", "native", "qwen"}:
+        raise ValueError("text_prompt_template must be auto, native, or qwen")
+    if text_prompt_template == "auto":
+        text_prompt_template = "qwen" if backbone == "qwen" else "native"
+
     return Config(
         path=path,
         model_root=resolve(model, "root"),
@@ -236,4 +259,9 @@ def load_config(path: str | Path, overrides: list[str] | None = None) -> Config:
         infer_every_steps=max(0, int(train.get("infer_every_steps", 0))) if isinstance(train, dict) else 0,
         infer_samples=max(1, int(train.get("infer_samples", 2))) if isinstance(train, dict) else 2,
         generation=dict(raw.get("generation") or {}),
+        first_codebook_weight_multiplier=first_codebook_weight_multiplier,
+        text_padding_weight=text_padding_weight,
+        epad_as_padding=epad_as_padding,
+        user_loss=user_loss,
+        text_prompt_template=text_prompt_template,
     )

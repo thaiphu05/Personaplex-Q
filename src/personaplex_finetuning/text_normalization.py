@@ -45,6 +45,30 @@ def normalize_vietnamese_text(text: str, mode: str = "no_diacritics") -> str:
     )
 
 
+def encode_system_prompt(tokenizer, text: str, template: str = "native") -> list[int]:
+    """Encode the system/role prompt with the template the backbone understands.
+
+    ``native`` keeps the PersonaPlex ``<system> ... <system>`` convention;
+    ``qwen`` uses the Hugging Face chat template of the wrapped tokenizer so
+    the role conditioning matches Qwen's pretraining format.
+    """
+    text = text.strip()
+    if template == "qwen":
+        hf_tokenizer = getattr(tokenizer, "_tokenizer", None)
+        if hf_tokenizer is None or not hasattr(hf_tokenizer, "apply_chat_template"):
+            raise ValueError("text_prompt_template=qwen requires a QwenTokenizer wrapper")
+        return list(
+            hf_tokenizer.apply_chat_template(
+                [{"role": "system", "content": text}],
+                tokenize=True,
+                add_generation_prompt=False,
+            )
+        )
+    if template != "native":
+        raise ValueError(f"unsupported text_prompt_template {template!r}; expected native or qwen")
+    return list(tokenizer.encode(f"<system> {text} <system>"))
+
+
 def _encode_telex_syllable(syllable: str) -> str:
     decomposed = unicodedata.normalize("NFD", syllable)
     letters: list[tuple[str, set[str], bool]] = []

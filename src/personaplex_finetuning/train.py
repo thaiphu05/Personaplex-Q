@@ -21,7 +21,12 @@ from .config import Config, load_config
 from .data import PreparedDataset, contiguous_chunks, sample_for_training_position
 from .inference import _export_context, export_stereo, generate as generate_inference
 from .lora import adapter_state_dict, inject_lora, load_adapter
-from .objective import stream_weights_torch, torch_weighted_cross_entropy
+from .objective import (
+    normalize_text_padding_ids,
+    stream_weights_torch,
+    torch_weighted_cross_entropy,
+    torch_weighted_cross_entropy_stats,
+)
 from .peft_adapter import (
     configure_qwen_trainable,
     detect_qwen_spec,
@@ -66,8 +71,12 @@ def build_example(config: Config, sample, runtime, random_crop: bool = False, rn
         )
     else:
         effective_sample = sample
-    builder = PersonaPlexTrainingExampleBuilder(runtime.codec, runtime.tokenizer, runtime.initial_tokens, runtime.zero_token)
-    return builder.apply_delays(builder.build(effective_sample), runtime.delays)
+    builder = PersonaPlexTrainingExampleBuilder(
+        runtime.codec, runtime.tokenizer, runtime.initial_tokens, runtime.zero_token,
+        text_prompt_template=config.text_prompt_template,
+    )
+    # PersonaPlex/Qwen forward_train applies the native per-stream delays once.
+    return builder.build(effective_sample)
 
 
 def effective_global_batch_size(per_process_batch_size: int, num_processes: int, gradient_accumulation_steps: int) -> int:
@@ -186,40 +195,95 @@ def write_tensorboard_scalars(writer, record: dict[str, float | int], trainable_
         writer.add_scalar(name, value, step)
 
 
-def loss_components(model_output, codes, example, text_padding_id, torch_module):
-    """Compute per-stream losses using GPU-native vectorized weights."""
+def tokenizer_text_padding_ids(tokenizer, include_end_padding: bool = False) -> tuple[int, ...]:
+    """Text IDs treated as padding (down-weighted in the loss).
+
+    EPAD marks a word onset; free-running generation can only start a word
+    after the model itself emits EPAD, so by default EPAD stays a full-weight
+    target. ``include_end_padding=True`` restores the legacy behavior.
+    """
+    ids = [int(tokenizer.padding_id)]
+    end_padding_id = getattr(tokenizer, "end_padding_id", None)
+    if include_end_padding and end_padding_id is not None and int(end_padding_id) not in ids:
+        ids.append(int(end_padding_id))
+    return normalize_text_padding_ids(ids)
+
+
+def loss_components(
+    model_output,
+    codes,
+    example,
+    text_padding_id,
+    torch_module,
+    first_codebook_weight_multiplier: float = 1.0,
+    text_padding_weight: float = 0.3,
+    *,
+    user_loss: bool = False,
+):
+    """Weighted losses where all audio groups share one mean denominator.
+
+    Sharing the denominator keeps ``nonsemantic_audio_weight`` effective: the
+    acoustic codebooks stay downweighted instead of cancelling inside their own
+    group mean. Prompt/padding positions carry zero weight.
+    """
     labels_tensor = torch_module.tensor(example.labels, dtype=torch_module.long, device=codes.device)
     mask_tensor = torch_module.tensor(example.loss_mask, dtype=torch_module.bool, device=codes.device)
-    weights = stream_weights_torch(labels_tensor, mask_tensor, text_padding_id)
+    weights = stream_weights_torch(
+        labels_tensor,
+        mask_tensor,
+        text_padding_id,
+        text_padding_weight=text_padding_weight,
+        first_codebook_weight_multiplier=first_codebook_weight_multiplier,
+        user_loss=user_loss,
+    )
 
-    text_target = codes[:, 0, :]
-    text_weight = weights[0].unsqueeze(0) * model_output.text_mask.to(weights.dtype)
-    text_loss = torch_weighted_cross_entropy(
+    text_target = labels_tensor[0]
+    text_weight = weights[0] * model_output.text_mask.to(weights.dtype)
+    text_stats = torch_weighted_cross_entropy_stats(
         model_output.text_logits.reshape(-1, model_output.text_logits.shape[-1]),
         text_target.reshape(-1),
         text_weight.reshape(-1),
     )
+    text_loss = text_stats[0] / text_stats[1].clamp_min(1e-12)
 
-    audio_target = codes[:, 1:17, :]
-    audio_weights = weights[1:17].unsqueeze(0) * model_output.mask.to(weights.dtype)
+    audio_target = labels_tensor[1:17]
+    audio_weights = weights[1:17] * model_output.mask.to(weights.dtype)
 
-    semantic = torch_weighted_cross_entropy(
-        model_output.logits[:, 0].reshape(-1, model_output.logits.shape[-1]),
-        audio_target[:, 0].reshape(-1),
-        audio_weights[:, 0].reshape(-1),
-    )
-    nonsemantic = torch_weighted_cross_entropy(
-        model_output.logits[:, 1:8].reshape(-1, model_output.logits.shape[-1]),
-        audio_target[:, 1:8].reshape(-1),
-        audio_weights[:, 1:8].reshape(-1),
-    )
-    return text_loss + semantic + nonsemantic, {"text": text_loss, "audio_semantic": semantic, "audio_nonsemantic": nonsemantic}
+    def audio_group(start: int, end: int):
+        return torch_weighted_cross_entropy_stats(
+            model_output.logits[:, start:end].reshape(-1, model_output.logits.shape[-1]),
+            audio_target[start:end].reshape(-1),
+            audio_weights[start:end].reshape(-1),
+        )
+
+    agent_semantic = audio_group(0, 1)
+    agent_acoustic = audio_group(1, 8)
+    user_semantic = audio_group(8, 9)
+    user_acoustic = audio_group(9, 16)
+    audio_denominator = sum(
+        stats[1] for stats in (agent_semantic, agent_acoustic, user_semantic, user_acoustic)
+    ).clamp_min(1e-12)
+
+    components = {
+        "text": text_loss,
+        "audio_semantic": (agent_semantic[0] + user_semantic[0]) / audio_denominator,
+        "audio_nonsemantic": (agent_acoustic[0] + user_acoustic[0]) / audio_denominator,
+    }
+    total = text_loss + (
+        agent_semantic[0] + agent_acoustic[0] + user_semantic[0] + user_acoustic[0]
+    ) / audio_denominator
+    return total, components
 
 
 def one_step(config: Config, runtime, example, optimizer=None):
     codes = torch.tensor(example.input_codes, dtype=torch.long, device=config.device).unsqueeze(0)
     output = model_forward_train(runtime.model, codes)
-    total, components = loss_components(output, codes, example, runtime.tokenizer.padding_id, torch)
+    total, components = loss_components(
+        output, codes, example,
+        tokenizer_text_padding_ids(runtime.tokenizer, config.epad_as_padding), torch,
+        config.first_codebook_weight_multiplier, config.text_padding_weight,
+        user_loss=config.user_loss,
+    )
     if optimizer is not None:
         optimizer.zero_grad(set_to_none=True)
         total.backward()
@@ -338,7 +402,12 @@ def evaluate_validation(config: Config, runtime, val_samples: list, accelerator:
             example = build_example(config, sample, runtime, random_crop=False)
             codes = torch.tensor(example.input_codes, dtype=torch.long, device=device).unsqueeze(0)
             output = unwrapped(codes)
-            total, comps = loss_components(output, codes, example, runtime.tokenizer.padding_id, torch)
+            total, comps = loss_components(
+                output, codes, example,
+                tokenizer_text_padding_ids(runtime.tokenizer, config.epad_as_padding), torch,
+                config.first_codebook_weight_multiplier, config.text_padding_weight,
+                user_loss=config.user_loss,
+            )
             totals["total"] += float(total.detach())
             totals["text"] += float(comps["text"].detach())
             totals["semantic"] += float(comps["audio_semantic"].detach())
@@ -513,6 +582,39 @@ def run(
                     config.quant_type,
                 )
         accelerator.wait_for_everyone()
+
+    # Drop fixed-window samples whose agent text cannot fit the frame budget:
+    # silently truncating tokens corrupts the alignment target.
+    if not config.random_crop:
+        frame_rate = runtime.codec.frame_rate
+        word_token_cache: dict[str, int] = {}
+
+        def _text_fits(sample) -> bool:
+            frames = max(0, int(round((sample.window_end_sec - sample.window_start_sec) * frame_rate)))
+            required = 0
+            for word in sample.words:
+                if word.speaker != "agent" or not sample.window_start_sec <= word.start < sample.window_end_sec:
+                    continue
+                count = word_token_cache.get(word.word)
+                if count is None:
+                    count = len(runtime.tokenizer.encode(" " + word.word))
+                    word_token_cache[word.word] = count
+                required += count
+            return required <= frames
+
+        train_kept = [sample for sample in train_samples if _text_fits(sample)]
+        val_kept = [sample for sample in val_samples if _text_fits(sample)]
+        skipped_train = len(train_samples) - len(train_kept)
+        skipped_val = len(val_samples) - len(val_kept)
+        if not train_kept:
+            raise RuntimeError("chunk filter removed every training sample; check window_seconds/tokenizer")
+        train_samples = train_kept
+        val_samples = val_kept
+        if accelerator.is_main_process and (skipped_train or skipped_val):
+            print(
+                f"[Chunk filter] train kept={len(train_samples)} skipped={skipped_train}; "
+                f"val kept={len(val_samples)} skipped={skipped_val} (text overflow)"
+            )
 
     # Inject LoRA with Stage-Wise Freezing support
     if config.backbone == "qwen":
@@ -720,7 +822,12 @@ def run(
 
             with accelerator.accumulate(runtime.model):
                 output = runtime.model(codes)
-                total, components = loss_components(output, codes, example, runtime.tokenizer.padding_id, torch)
+                total, components = loss_components(
+                    output, codes, example,
+                    tokenizer_text_padding_ids(runtime.tokenizer, config.epad_as_padding), torch,
+                    config.first_codebook_weight_multiplier, config.text_padding_weight,
+                    user_loss=config.user_loss,
+                )
                 accelerator.backward(total)
 
                 grad_norm = step_optimizer_if_ready(accelerator, optimizer, scheduler, trainable)

@@ -793,23 +793,29 @@ def run(
                 infer_dir = run_dir / "infer" / f"step_{optimizer_step:06d}"
                 unwrapped = accelerator.unwrap_model(runtime.model)
                 was_training = unwrapped.training
+                infer_error = None
                 unwrapped.eval()
                 try:
                     for sample in (val_samples or train_samples)[: config.infer_samples]:
-                        sample_dir = infer_dir / sample.sample_id
-                        sample_dir.mkdir(parents=True, exist_ok=True)
-                        _export_context(sample, sample_dir)
-                        generate_inference(
-                            config, sample, sample_dir / "agent.wav", sample_dir / "agent.txt",
-                            adapter=None, runtime=runtime, model=unwrapped, gen_cfg=config.generation,
-                        )
-                        export_stereo(sample_dir)
-                        infer_outputs.append(str(sample_dir))
+                        try:
+                            sample_dir = infer_dir / sample.sample_id
+                            sample_dir.mkdir(parents=True, exist_ok=True)
+                            _export_context(sample, sample_dir)
+                            generate_inference(
+                                config, sample, sample_dir / "agent.wav", sample_dir / "agent.txt",
+                                adapter=None, runtime=runtime, model=unwrapped, gen_cfg=config.generation,
+                            )
+                            export_stereo(sample_dir)
+                            infer_outputs.append(str(sample_dir))
+                        except Exception as exc:  # a failed sample must never kill training
+                            infer_error = f"{sample.sample_id}: {exc}"
+                            tqdm.write(json.dumps({"event": "inference_error", "step": optimizer_step, "error": infer_error}))
                 finally:
                     unwrapped.train(was_training)
                 tqdm.write(json.dumps({
                     "event": "inference_samples",
                     "step": optimizer_step,
+                    "infer_error": infer_error,
                     "outputs": infer_outputs[-config.infer_samples:],
                 }))
 

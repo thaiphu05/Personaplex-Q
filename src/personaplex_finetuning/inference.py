@@ -120,7 +120,7 @@ def generate(
     if not pcm_frames:
         raise RuntimeError("generation produced no frames")
     output_wav.parent.mkdir(parents=True, exist_ok=True)
-    sphn.write_wav(str(output_wav), np.concatenate(pcm_frames), runtime.codec.sample_rate)
+    sphn.write_wav(str(output_wav), np.ascontiguousarray(np.concatenate(pcm_frames)), runtime.codec.sample_rate)
     if config.backbone == "qwen":
         cleaned_text = runtime.tokenizer._tokenizer.decode(text_token_ids)
     else:
@@ -131,6 +131,7 @@ def generate(
 
 def _export_context(sample: PreparedSample, output_dir: Path) -> None:
     import shutil
+    import numpy as np
     import sphn
 
     # Export user audio window
@@ -142,9 +143,10 @@ def _export_context(sample: PreparedSample, output_dir: Path) -> None:
     original_window = audio[..., start:end]
     if original_window.size == 0:
         raise ValueError(f"{sample.sample_id}: original dialogue window contains no audio")
-    sphn.write_wav(str(output_dir / "dialogue_original.wav"), original_window, 24000)
+    # Slices are strided views; libsndfile requires packed C-contiguous buffers.
+    sphn.write_wav(str(output_dir / "dialogue_original.wav"), np.ascontiguousarray(original_window), 24000)
     user_audio = audio[sample.user_channel, start:end]
-    sphn.write_wav(str(output_dir / "user.wav"), user_audio, 24000)
+    sphn.write_wav(str(output_dir / "user.wav"), np.ascontiguousarray(user_audio), 24000)
 
     # Export user text in window
     user_words = [
@@ -175,7 +177,7 @@ def export_stereo(output_dir: Path) -> Path:
     length = min(a.shape[-1], u.shape[-1])
     stereo = np.stack([a[..., :length], u[..., :length]], axis=0)
     path = output_dir / "dialogue_stereo.wav"
-    sphn.write_wav(str(path), stereo, 24000)
+    sphn.write_wav(str(path), np.ascontiguousarray(stereo), 24000)
     return path
 
 

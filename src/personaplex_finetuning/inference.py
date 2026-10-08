@@ -4,15 +4,26 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from dataclasses import replace
 from pathlib import Path
 
 from .config import Config
 from .data import PreparedSample
 from .lora import inject_lora, load_adapter
-from .runtime import RuntimePaths, load_runtime
+from .peft_adapter import configure_qwen_trainable, inject_depformer_lora, inject_qwen_lora, load_qwen_adapter
+from .runtime import QwenRuntimePaths, RuntimePaths, load_qwen_runtime, load_runtime
 
 logger = logging.getLogger(__name__)
+
+
+def _adapter_file(adapter: Path) -> Path:
+    """Resolve a LoRA checkpoint directory to its weights file."""
+    path = Path(adapter)
+    if path.is_dir():
+        candidate = path / "lora.safetensors"
+        return candidate if candidate.is_file() else path
+    return path
 
 
 def _prepare_input_audio(input_file: Path, output_dir: Path) -> Path:
@@ -35,22 +46,53 @@ def _prepare_input_audio(input_file: Path, output_dir: Path) -> Path:
     return normalized_path
 
 
-def generate(config: Config, sample: PreparedSample, output_wav: Path, output_text: Path, adapter: Path | None) -> None:
+def generate(
+    config: Config,
+    sample: PreparedSample,
+    output_wav: Path,
+    output_text: Path,
+    adapter: Path | None,
+    runtime=None,
+    model=None,
+    gen_cfg: dict | None = None,
+) -> None:
     import importlib
     import numpy as np
     import sphn
     import torch
 
-    runtime = load_runtime(RuntimePaths(config.model_root, config.personaplex_source), config.device, config.qlora, config.quant_type)
+    if runtime is None:
+        if config.backbone == "qwen":
+            runtime = load_qwen_runtime(
+                QwenRuntimePaths(config.model_root, config.personaplex_source, config.qwen_model_id),
+                str(config.device),
+            )
+        else:
+            runtime = load_runtime(RuntimePaths(config.model_root, config.personaplex_source), config.device, config.qlora, config.quant_type)
+    model = model if model is not None else runtime.model
     if adapter is not None:
-        inject_lora(runtime.model, config.lora_rank, config.lora_alpha)
-        load_adapter(runtime.model, adapter)
-    runtime.model.eval()
+        if config.backbone == "qwen":
+            inject_qwen_lora(model, config.lora_qwen_rank, config.lora_qwen_alpha)
+            inject_depformer_lora(model, config.lora_depformer_rank, config.lora_depformer_alpha)
+            configure_qwen_trainable(model, ft_embed=config.ft_embed)
+            load_qwen_adapter(model, _adapter_file(adapter))
+        else:
+            inject_lora(model, config.lora_rank, config.lora_alpha)
+            load_adapter(model, adapter)
+    model.eval()
+    cache_streaming = config.backbone == "qwen"
+    if cache_streaming:
+        # A growing KV cache cannot be replayed by CUDA graphs.
+        os.environ.setdefault("NO_CUDA_GRAPH", "1")
+        model.start_streaming_caches()
+    gen = gen_cfg or {}
     lm_module = importlib.import_module("moshi.models.lm")
     generator = lm_module.LMGen(
-        runtime.model, audio_silence_frame_cnt=6, sample_rate=runtime.codec.sample_rate,
-        frame_rate=runtime.codec.frame_rate, device=config.device, use_sampling=True,
-        temp=0.8, temp_text=0.7, top_k=250, top_k_text=25,
+        model, audio_silence_frame_cnt=int(gen.get("audio_silence_frame_cnt", 6)),
+        sample_rate=runtime.codec.sample_rate, frame_rate=runtime.codec.frame_rate,
+        device=str(config.device), use_sampling=bool(gen.get("use_sampling", True)),
+        temp=float(gen.get("temp", 0.8)), temp_text=float(gen.get("temp_text", 0.7)),
+        top_k=int(gen.get("top_k", 250)), top_k_text=int(gen.get("top_k_text", 25)),
     )
     generator.load_voice_prompt(str(sample.voice_prompt_wav))
     generator.text_prompt_tokens = runtime.tokenizer.encode(f"<system> {sample.text_prompt.strip()} <system>")
@@ -60,23 +102,30 @@ def generate(config: Config, sample: PreparedSample, output_wav: Path, output_te
     text_token_ids: list[int] = []
     # Mimi's decoder is causal/streaming: resetting it for every 80 ms frame
     # inserts boundary transients that sound like clicks and clipped syllables.
-    with torch.no_grad(), runtime.codec.mimi.streaming(1), generator.streaming(1):
-        generator.step_system_prompts(runtime.codec.mimi)
-        for frame in range(user.shape[-1]):
-            tokens = generator.step(input_tokens=user[:, :, frame : frame + 1])
-            if tokens is None:
-                continue
-            decoded = runtime.codec.mimi.decode(tokens[:, 1:9]).squeeze().detach().float().cpu().numpy()
-            pcm_frames.append(decoded)
-            token = int(tokens[0, 0, 0])
-            if token not in (0, runtime.tokenizer.padding_id):
-                text_token_ids.append(token)
+    try:
+        with torch.no_grad(), runtime.codec.mimi.streaming(1), generator.streaming(1):
+            generator.step_system_prompts(runtime.codec.mimi)
+            for frame in range(user.shape[-1]):
+                tokens = generator.step(input_tokens=user[:, :, frame : frame + 1])
+                if tokens is None:
+                    continue
+                decoded = runtime.codec.mimi.decode(tokens[:, 1:9]).squeeze().detach().float().cpu().numpy()
+                pcm_frames.append(decoded)
+                token = int(tokens[0, 0, 0])
+                if token not in (0, runtime.tokenizer.padding_id):
+                    text_token_ids.append(token)
+    finally:
+        if cache_streaming:
+            model.stop_streaming_caches()
     if not pcm_frames:
-        raise RuntimeError("native PersonaPlex generation produced no frames")
+        raise RuntimeError("generation produced no frames")
     output_wav.parent.mkdir(parents=True, exist_ok=True)
     sphn.write_wav(str(output_wav), np.concatenate(pcm_frames), runtime.codec.sample_rate)
-    # SentencePiece decode_ids merges multi-byte tokens into clean Vietnamese text
-    cleaned_text = runtime.tokenizer._processor.decode_ids(text_token_ids)
+    if config.backbone == "qwen":
+        cleaned_text = runtime.tokenizer._tokenizer.decode(text_token_ids)
+    else:
+        # SentencePiece decode_ids merges multi-byte tokens into clean Vietnamese text
+        cleaned_text = runtime.tokenizer._processor.decode_ids(text_token_ids)
     output_text.write_text(cleaned_text, encoding="utf-8")
 
 
@@ -110,6 +159,26 @@ def _export_context(sample: PreparedSample, output_dir: Path) -> None:
         shutil.copyfile(sample.voice_prompt_wav, output_dir / "prompt_voice.wav")
 
 
+def export_stereo(output_dir: Path) -> Path:
+    """Combine generated ``agent.wav`` with the input ``user.wav`` into one stereo WAV."""
+    import numpy as np
+    import sphn
+
+    agent, agent_rate = sphn.read(str(output_dir / "agent.wav"))
+    user, user_rate = sphn.read(str(output_dir / "user.wav"))
+    if agent_rate != 24000:
+        agent = sphn.resample(agent, src_sample_rate=agent_rate, dst_sample_rate=24000)
+    if user_rate != 24000:
+        user = sphn.resample(user, src_sample_rate=user_rate, dst_sample_rate=24000)
+    a = np.asarray(agent).squeeze()
+    u = np.asarray(user).squeeze()
+    length = min(a.shape[-1], u.shape[-1])
+    stereo = np.stack([a[..., :length], u[..., :length]], axis=0)
+    path = output_dir / "dialogue_stereo.wav"
+    sphn.write_wav(str(path), stereo, 24000)
+    return path
+
+
 def smoke(
     config: Config,
     sample: PreparedSample,
@@ -136,8 +205,9 @@ def smoke(
         )
 
     _export_context(sample, output_dir)
-    generate(config, sample, output_dir / "base.wav", output_dir / "base.txt", None)
-    generate(config, sample, output_dir / "finetuned.wav", output_dir / "finetuned.txt", adapter)
+    gen_cfg = getattr(config, "generation", None)
+    generate(config, sample, output_dir / "base.wav", output_dir / "base.txt", None, gen_cfg=gen_cfg)
+    generate(config, sample, output_dir / "finetuned.wav", output_dir / "finetuned.txt", adapter, gen_cfg=gen_cfg)
     output_warnings = []
     for name in ("dialogue_original.wav", "user.wav", "base.wav", "finetuned.wav", "base.txt", "finetuned.txt"):
         path = output_dir / name

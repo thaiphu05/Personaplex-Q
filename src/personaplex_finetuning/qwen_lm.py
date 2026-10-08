@@ -121,6 +121,9 @@ class QwenMoshiLM(nn.Module):
         self.end_of_text_padding_id = end_of_text_padding_id
         self.text_initial_token_id = text_initial_token_id
         self.depformer_weights_per_step_schedule = depformer_weights_per_step_schedule
+        # Incremental KV-cache decoding state (LMGen feeds one frame per call).
+        self._hf_cache = None
+        self._cache_streaming = False
 
         factory_kwargs = {"device": device, "dtype": dtype}
         self.emb = nn.ModuleList(
@@ -178,6 +181,16 @@ class QwenMoshiLM(nn.Module):
     def device(self):
         return next(iter(self.parameters())).device
 
+    @property
+    def text_card(self) -> int:
+        """Cardinality of the Qwen text vocabulary (used by LMGen)."""
+        return int(self.qwen.config.vocab_size)
+
+    @property
+    def ungenerated_token_id(self) -> int:
+        """Marker for tokens LMGen should sample rather than read from the prompt."""
+        return -2
+
     def _get_initial_token(self) -> torch.Tensor:
         """Return the initial tokens fed to the very first timestep, [1, K, 1]."""
         device = self.device
@@ -212,11 +225,32 @@ class QwenMoshiLM(nn.Module):
         return text_emb if input_ is None else input_ + text_emb
 
     def forward_embeddings(self, input: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Run the frozen Qwen decoder; return hidden context and text logits."""
-        outputs = self.qwen(inputs_embeds=input, output_hidden_states=True, return_dict=True)
+        """Run the frozen Qwen decoder; return hidden context and text logits.
+
+        When ``start_streaming_caches`` was called, successive single-frame calls
+        reuse the Hugging Face KV cache so the model keeps dialogue context.
+        """
+        kwargs = {"output_hidden_states": True, "return_dict": True}
+        if self._cache_streaming:
+            if self._hf_cache is not None:
+                kwargs["past_key_values"] = self._hf_cache
+            kwargs["use_cache"] = True
+        outputs = self.qwen(inputs_embeds=input, **kwargs)
+        if self._cache_streaming:
+            self._hf_cache = outputs.past_key_values
         hidden = outputs.hidden_states[-1]
         text_logits = self.qwen.lm_head(hidden)
         return hidden, text_logits[:, None]
+
+    def start_streaming_caches(self) -> None:
+        """Enable incremental KV-cache decoding for LMGen-style single-frame calls."""
+        self._hf_cache = None
+        self._cache_streaming = True
+
+    def stop_streaming_caches(self) -> None:
+        """Disable cache reuse and drop the cached attention state."""
+        self._cache_streaming = False
+        self._hf_cache = None
 
     def forward_codes(self, sequence: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         return self.forward_embeddings(self.embed_codes(sequence))
@@ -248,6 +282,34 @@ class QwenMoshiLM(nn.Module):
             all_logits.append(logits.view(B, T, -1))
         logits = torch.stack(all_logits, 1)
         if logits.dim() != 4:  # [B, Ka, T, card]
+            raise RuntimeError(f"unexpected depformer logits shape {logits.shape}")
+        return logits
+
+    def forward_depformer(
+        self,
+        depformer_cb_index: int,
+        sequence: torch.Tensor,
+        transformer_out: torch.Tensor,
+    ) -> torch.Tensor:
+        """Streaming depformer step mirroring ``moshi.models.lm.LMModel.forward_depformer``."""
+        B, K, S = sequence.shape
+        if K != 1 or S != 1:
+            raise ValueError(f"Depformer streaming expects one codebook and one step, got {K}, {S}")
+        if transformer_out.shape[1] != 1:
+            raise ValueError("transformer_out must be a single step")
+        linear_index = depformer_cb_index
+        if self.depformer_weights_per_step_schedule is not None:
+            linear_index = self.depformer_weights_per_step_schedule[depformer_cb_index]
+        depformer_input = self.depformer_in[linear_index](transformer_out)
+        if depformer_cb_index == 0:
+            last_token_input = self.text_depth_adapter(self._embed_text(sequence[:, 0]))
+        else:
+            last_token_input = self.depformer_emb[depformer_cb_index - 1](sequence[:, 0])
+        depformer_input = depformer_input + last_token_input
+        dep_output = self.depformer(depformer_input)
+        logits = self.linears[depformer_cb_index](dep_output)
+        logits = logits[:, None]
+        if logits.dim() != 4:  # [B, Ka, S, card]
             raise RuntimeError(f"unexpected depformer logits shape {logits.shape}")
         return logits
 

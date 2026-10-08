@@ -3,7 +3,7 @@
 # Run: python -m personaplex_finetuning.train --config configs/config.yaml
 # Smoke first: add --smoke
 defaults:
-  - model: qwen35-9b
+  - model: qwen3-8b
   - data: vietnamese
   - lora: qwen
   - train: qwen
@@ -17,13 +17,13 @@ model:
   source: ../src
   device: cuda
   backbone: qwen
-  qwen_id: Qwen/Qwen3.5-9B         # HF id or local path (auto-downloaded by transformers)
+  qwen_id: Qwen/Qwen3-8B         # HF id or local path (auto-downloaded by transformers)
 
 data:
   prepared_dir: ../prepared        # prepared dataset dir (train.jsonl + samples/)
 
 train:
-  output_dir: ../runs/qwen35-b200
+  output_dir: ../runs/qwen3-8b-b200
   max_steps: 10000
   learning_rate: 1.0e-5            # backbone LoRA
   interface_lr: 5.0e-5             # depth I/O + adapters

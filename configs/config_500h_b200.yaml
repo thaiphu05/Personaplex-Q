@@ -42,8 +42,8 @@ train:
   learning_rate: 2.0e-6          # optim.lr
   depformer_learning_rate: 5.0e-6
   stage: joint
-  max_steps: 2000                # giữ từ config gốc; 2 pass đầy đủ ≈ 8550
-                                 # (kiểm tra num_train_samples in lúc startup, gbs = 1×2GPU×2 = 4)
+  max_steps: 2000             # giữ từ config gốc; 2 pass đầy đủ ≈ 8550
+                              # (kiểm tra num_train_samples in lúc startup, gbs = 1×2GPU×2 = 4)
   gradient_accumulation_steps: 2
   warmup_steps: 0
   eval_every_steps: 500

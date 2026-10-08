@@ -19,6 +19,7 @@ from tqdm.auto import tqdm
 
 from .config import Config, load_config
 from .data import PreparedDataset, contiguous_chunks, sample_for_training_position
+from .inference import _export_context, export_stereo, generate as generate_inference
 from .lora import adapter_state_dict, inject_lora, load_adapter
 from .objective import stream_weights_torch, torch_weighted_cross_entropy
 from .peft_adapter import (
@@ -670,6 +671,7 @@ def run(
     best_val_loss = float("inf")
     last_record = None
     reload_checks: list[dict[str, float | int]] = []
+    infer_outputs: list[str] = []
     started = time.monotonic()
 
     try:
@@ -782,6 +784,35 @@ def run(
                         reload_checks.append({"step": optimizer_step, "loss": reload_loss})
                 accelerator.wait_for_everyone()
 
+            # Free-running inference samples (main process only)
+            if (
+                config.infer_every_steps > 0
+                and optimizer_step % config.infer_every_steps == 0
+                and accelerator.is_main_process
+            ):
+                infer_dir = run_dir / "infer" / f"step_{optimizer_step:06d}"
+                unwrapped = accelerator.unwrap_model(runtime.model)
+                was_training = unwrapped.training
+                unwrapped.eval()
+                try:
+                    for sample in (val_samples or train_samples)[: config.infer_samples]:
+                        sample_dir = infer_dir / sample.sample_id
+                        sample_dir.mkdir(parents=True, exist_ok=True)
+                        _export_context(sample, sample_dir)
+                        generate_inference(
+                            config, sample, sample_dir / "agent.wav", sample_dir / "agent.txt",
+                            adapter=None, runtime=runtime, model=unwrapped, gen_cfg=config.generation,
+                        )
+                        export_stereo(sample_dir)
+                        infer_outputs.append(str(sample_dir))
+                finally:
+                    unwrapped.train(was_training)
+                tqdm.write(json.dumps({
+                    "event": "inference_samples",
+                    "step": optimizer_step,
+                    "outputs": infer_outputs[-config.infer_samples:],
+                }))
+
         if log_file:
             log_file.close()
         if progress is not None:
@@ -804,6 +835,7 @@ def run(
             "best_checkpoint": str(best_saved) if best_saved else None,
             "best_val_loss": best_val_loss if best_val_loss < float("inf") else None,
             "reload_checks": reload_checks,
+            "infer_outputs": infer_outputs,
         }
         (run_dir / "run.json").write_text(json.dumps(run_info, indent=2))
         report = config.path.parent.parent / "reports" / "overfit_10.md"

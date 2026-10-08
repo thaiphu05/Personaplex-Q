@@ -112,10 +112,7 @@ lora:
 # 4. TRAIN — optimizer, schedule, checkpoint
 # ==============================================================================
 train:
-  # Thư mục lưu runs (mỗi run tạo subdir train_YYYYMMDD_HHMMSS)
   output_dir: ../runs/qwen35                 # path tương đối/abs
-
-  # Tổng số optimizer update
   max_steps: 10000                           # int; 2000h data → 20-50k steps hợp lý
 
   # LR backbone LoRA

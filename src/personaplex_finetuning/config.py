@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import dataclasses
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -51,6 +52,9 @@ class Config:
     val_manifest_path: Path | None = None
     gradient_checkpointing: bool = False
     mixed_precision: str = "bf16"
+    infer_every_steps: int = 0
+    infer_samples: int = 2
+    generation: dict[str, Any] = dataclasses.field(default_factory=dict)
 
     @property
     def manifest(self) -> Path:
@@ -229,4 +233,7 @@ def load_config(path: str | Path, overrides: list[str] | None = None) -> Config:
         val_manifest_path=val_manifest_path,
         gradient_checkpointing=bool(train.get("gradient_checkpointing", False)) if isinstance(train, dict) else False,
         mixed_precision=str(train.get("mixed_precision", "bf16")) if isinstance(train, dict) else "bf16",
+        infer_every_steps=max(0, int(train.get("infer_every_steps", 0))) if isinstance(train, dict) else 0,
+        infer_samples=max(1, int(train.get("infer_samples", 2))) if isinstance(train, dict) else 2,
+        generation=dict(raw.get("generation") or {}),
     )

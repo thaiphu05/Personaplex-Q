@@ -125,7 +125,7 @@ class PersonaPlexTrainingExampleBuilder:
         loss_mask = (
             (prompt_mask + dialogue_text_mask),
             *((prompt_mask + (True,) * dialogue_frames) for _ in range(8)),
-            *((False,) * len(agent_text) for _ in range(8)),
+            *((prompt_mask + (True,) * dialogue_frames) for _ in range(8)),
         )
         return TrainingExample(
             input_codes=streams,

@@ -158,6 +158,11 @@ def torch_weighted_cross_entropy_stats(logits, targets, weights):
 
     if logits.ndim != 2 or targets.ndim != 1 or weights.ndim != 1:
         raise ValueError("expected flattened logits [N,V], targets [N], weights [N]")
+    if logits.shape[0] != targets.numel() or targets.numel() != weights.numel():
+        raise ValueError(
+            f"logits/targets/weights length mismatch: {logits.shape[0]} vs "
+            f"{targets.numel()} vs {weights.numel()}"
+        )
     ignored = weights == 0
     safe_targets = targets.masked_fill(ignored, 0)
     safe_logits = logits.float().masked_fill(ignored.unsqueeze(1), 0.0)

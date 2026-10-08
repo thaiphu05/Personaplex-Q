@@ -57,13 +57,14 @@ def encode_system_prompt(tokenizer, text: str, template: str = "native") -> list
         hf_tokenizer = getattr(tokenizer, "_tokenizer", None)
         if hf_tokenizer is None or not hasattr(hf_tokenizer, "apply_chat_template"):
             raise ValueError("text_prompt_template=qwen requires a QwenTokenizer wrapper")
-        return list(
-            hf_tokenizer.apply_chat_template(
-                [{"role": "system", "content": text}],
-                tokenize=True,
-                add_generation_prompt=False,
-            )
+        encoded = hf_tokenizer.apply_chat_template(
+            [{"role": "system", "content": text}],
+            tokenize=True,
+            add_generation_prompt=False,
         )
+        if isinstance(encoded, dict):
+            encoded = encoded["input_ids"]
+        return list(encoded)
     if template != "native":
         raise ValueError(f"unsupported text_prompt_template {template!r}; expected native or qwen")
     return list(tokenizer.encode(f"<system> {text} <system>"))

@@ -24,7 +24,6 @@ from .lora import adapter_state_dict, inject_lora, load_adapter
 from .objective import (
     normalize_text_padding_ids,
     stream_weights_torch,
-    torch_weighted_cross_entropy,
     torch_weighted_cross_entropy_stats,
 )
 from .peft_adapter import (
@@ -238,7 +237,10 @@ def loss_components(
     )
 
     text_target = labels_tensor[0]
-    text_weight = weights[0] * model_output.text_mask.to(weights.dtype)
+    text_mask = model_output.text_mask
+    if text_mask.ndim == 3:
+        text_mask = text_mask[0, 0]
+    text_weight = weights[0] * text_mask.to(weights.dtype)
     text_stats = torch_weighted_cross_entropy_stats(
         model_output.text_logits.reshape(-1, model_output.text_logits.shape[-1]),
         text_target.reshape(-1),
@@ -247,7 +249,10 @@ def loss_components(
     text_loss = text_stats[0] / text_stats[1].clamp_min(1e-12)
 
     audio_target = labels_tensor[1:17]
-    audio_weights = weights[1:17] * model_output.mask.to(weights.dtype)
+    model_mask = model_output.mask
+    if model_mask.ndim == 3:
+        model_mask = model_mask[0]
+    audio_weights = weights[1:17] * model_mask.to(weights.dtype)
 
     def audio_group(start: int, end: int):
         return torch_weighted_cross_entropy_stats(

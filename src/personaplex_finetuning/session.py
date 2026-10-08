@@ -16,6 +16,7 @@ except ImportError:
 
 from .lora import inject_lora, load_adapter
 from .runtime import RuntimePaths, load_runtime
+from .text_normalization import encode_system_prompt
 
 logger = logging.getLogger(__name__)
 
@@ -77,8 +78,10 @@ class InteractiveSession:
         temp_text: float = 0.7,
         top_k: int = 250,
         top_k_text: int = 25,
+        text_prompt_template: str = "native",
     ):
         self.device = device
+        self.text_prompt_template = text_prompt_template
         self.model_root = Path(model_root).resolve()
         if personaplex_source is None:
             # Default to bundled src in current package
@@ -176,9 +179,9 @@ class InteractiveSession:
             self.generator.load_voice_prompt(str(voice_path))
 
         if text_prompt and text_prompt.strip():
-            formatted_text = wrap_with_system_tags(text_prompt)
-            logger.info("Setting system text prompt: %s", formatted_text)
-            self.generator.text_prompt_tokens = self.runtime.tokenizer.encode(formatted_text)
+            prompt_tokens = encode_system_prompt(self.runtime.tokenizer, text_prompt, self.text_prompt_template)
+            logger.info("Setting system text prompt (%s template): %s", self.text_prompt_template, text_prompt.strip())
+            self.generator.text_prompt_tokens = prompt_tokens
         else:
             self.generator.text_prompt_tokens = None
 

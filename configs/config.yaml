@@ -1,7 +1,9 @@
-# Master Hydra configuration — Qwen3.5-9B backbone on B200 (Blackwell sm_100)
-# Requires: CUDA 12.8, torch>=2.7 (cu128), transformers>=4.57
+# ==============================================================================
+# Master Hydra config — Qwen3-8B backbone on B200 (Blackwell sm_100)
+# Requires: CUDA 12.8 driver, torch>=2.7 cu128, transformers==4.57.x
 # Run: python -m personaplex_finetuning.train --config configs/config.yaml
-# Smoke first: add --smoke
+#      smoke: thêm --smoke data.shuffle=false
+# ==============================================================================
 defaults:
   - model: qwen3-8b
   - data: vietnamese
@@ -11,34 +13,55 @@ defaults:
 
 seed: 42
 
-# --- B200 overrides (override presets above) ---
+# --- overrides ---
 model:
-  root: ../models                  # PersonaPlex-7B checkpoint dir (Mimi codec + depformer graft)
+  root: /home/voice/data/voice/personaplex-7b-v1   # PersonaPlex checkpoint (Mimi + depformer graft)
   source: ../src
   device: cuda
   backbone: qwen
-  qwen_id: Qwen/Qwen3-8B         # HF id or local path (auto-downloaded by transformers)
+  qwen_id: /home/voice/data/models/Qwen3-8B        # local dir hoặc HF id
 
 data:
-  prepared_dir: ../prepared        # prepared dataset dir (train.jsonl + samples/)
+  prepared_dir: /home/voice/data/voice/vdt/data_ready/synthetic_500h
+  window_seconds: 100
+  shuffle: true
+  random_crop: false
+  prompt_aug_prob: 0.0
+  static_chunking: false
+  swap_roles_after_pass: false
+  val_ratio: 0.05
+  # val_manifest: null           # bỏ trống = tự tìm val.jsonl, không có thì split theo val_ratio
 
 train:
-  output_dir: ../runs/qwen3-8b-b200
-  max_steps: 10000
-  learning_rate: 1.0e-5            # backbone LoRA
+  output_dir: ../runs/qwen3-8B
+  max_steps: 20000
+  learning_rate: 1.0e-5            # Qwen backbone LoRA
   interface_lr: 5.0e-5             # depth I/O + adapters
-  audio_embed_lr: 1.0e-4
-  gradient_accumulation_steps: 8
-  warmup_steps: 1000
+  audio_embed_lr: 1.0e-4           # emb table (chỉ khi ft_embed=true)
+  depformer_learning_rate: 5.0e-6  # depth LoRA; bỏ trống = dùng interface_lr
+  gradient_accumulation_steps: 8   # global batch = 1 × nGPU × 8
+  warmup_steps: 100
   eval_every_steps: 500
-  save_every_steps: 500
-  gradient_checkpointing: false    # 9B fits easily in 180GB VRAM
-  mixed_precision: bf16            # native on Blackwell
+  save_every_steps: 1000
+  gradient_checkpointing: false    # 8B fit thoải mái trong 180GB VRAM
+  mixed_precision: bf16
+  infer_every_steps: 1000          # free-generation mỗi N step (0 = tắt)
+  infer_samples: 2                 # số mẫu val sinh mỗi lần infer
 
 lora:
   qwen_rank: 64
   qwen_alpha: 128
   depformer_rank: 64
   depformer_alpha: 128
+  qwen_targets: "q_proj,v_proj"    # Qwen3-8B; Qwen3.5-9B thì để trống = auto-detect
   ft_embed: true
-  qlora: false                     # QLoRA unsupported on Qwen path
+  qlora: false                     # Qwen path không hỗ trợ QLoRA
+
+# Decode params cho inference (infer_every_steps + tools.inference_smoke)
+generation:
+  use_sampling: true               # false = greedy
+  temp: 0.8                        # audio temperature
+  temp_text: 0.7                   # text temperature
+  top_k: 250                       # audio top-k
+  top_k_text: 25                   # text top-k
+  audio_silence_frame_cnt: 6

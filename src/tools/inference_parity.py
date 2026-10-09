@@ -10,10 +10,11 @@ training vs LMGen's per-frame streaming encode).
 python -m tools.inference_parity \
     --config configs/qwen3-0.6b-overfit.yaml \
     --adapter runs/qwen3-06b-overfit/train_*/checkpoints/checkpoint_000500 \
-    --index 0 --output-dir outputs/parity [--train-voice-codes]
+    --index 0 --output-dir outputs/parity [--lmgen-voice-encode]
 
-``--train-voice-codes`` replays the training voice-prompt codes instead of
-LMGen's own encoding, isolating that difference.
+The forced run steps the system prompt like ``inference.generate`` (training
+voice-prompt codes). ``--lmgen-voice-encode`` uses LMGen's own streaming
+encode instead, which reproduces the text-to-PAD divergence it caused.
 """
 
 from __future__ import annotations
@@ -82,6 +83,7 @@ def main() -> int:
         attach_adapter,
         inference_autocast,
         load_inference_runtime,
+        step_training_system_prompts,
     )
     from personaplex_finetuning.text_normalization import encode_system_prompt
     from personaplex_finetuning.train import build_example
@@ -91,8 +93,8 @@ def main() -> int:
     parser.add_argument("--adapter", required=True)
     parser.add_argument("--index", type=int, default=0)
     parser.add_argument("--output-dir", default="outputs/parity")
-    parser.add_argument("--train-voice-codes", action="store_true",
-                        help="Replay the training voice-prompt codes instead of LMGen's streaming encode.")
+    parser.add_argument("--lmgen-voice-encode", action="store_true",
+                        help="Use LMGen's per-frame streaming voice-prompt encode instead of the training codes.")
     parser.add_argument("--no-align", action="store_true",
                         help="Skip align_generator_with_training (reproduces the old one-frame offset).")
     args = parser.parse_args()
@@ -158,16 +160,11 @@ def main() -> int:
             if not args.no_align:
                 align_generator_with_training(generator)
             aligned_offset = int(generator._streaming_state.offset)
-            if args.train_voice_codes:
-                for frame in range(len(train_voice[0])):
-                    voice_frame = torch.tensor([[train_voice[k][frame]] for k in range(8)], device=device).unsqueeze(0)
-                    generator._step_voice_prompt_frame(voice_frame, [])
-                generator._step_audio_silence()
-                generator._step_text_prompt()
-                generator._step_audio_silence()
-            else:
+            if args.lmgen_voice_encode:
                 generator.load_voice_prompt(str(sample.voice_prompt_wav))
                 generator.step_system_prompts(mimi)
+            else:
+                step_training_system_prompts(generator, train_voice, device)
             lmgen_prompt_frames = int(generator._streaming_state.offset) - aligned_offset
             for d in range(dialogue_frames):
                 t = start + d
@@ -196,7 +193,7 @@ def main() -> int:
 
     result = {
         "sample_id": sample.sample_id,
-        "train_voice_codes": bool(args.train_voice_codes),
+        "lmgen_voice_encode": bool(args.lmgen_voice_encode),
         "aligned": not args.no_align,
         "prompt_frames": {"train": start, "lmgen": lmgen_prompt_frames},
         "voice_prompt": voice_report,

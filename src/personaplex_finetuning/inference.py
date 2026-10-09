@@ -116,6 +116,26 @@ def align_generator_with_training(generator) -> None:
     generator.step()
 
 
+def step_training_system_prompts(generator, voice_codes, device) -> None:
+    """Step LMGen through the hybrid system prompt with the training voice codes.
+
+    Mirrors ``LMGen.step_system_prompts`` (voice, silence, text, silence) but
+    takes the voice-prompt codes from ``Codec.encode_voice_prompt``, the
+    full-file encode the training sequence uses. LMGen's own
+    ``load_voice_prompt`` encodes frame by frame through streaming Mimi, which
+    yields slightly different codes; that context shift is enough to flip the
+    text head to PAD and destabilize the agent voice.
+    """
+    import torch
+
+    for frame in zip(*voice_codes):
+        tokens = torch.tensor([[[int(code)] for code in frame]], device=device)  # int64 [1, 8, 1]
+        generator._step_voice_prompt_frame(tokens, [])
+    generator._step_audio_silence()
+    generator._step_text_prompt()
+    generator._step_audio_silence()
+
+
 def generate(
     config: Config,
     sample: PreparedSample,
@@ -154,7 +174,7 @@ def generate(
     # silence frames. Training fills those frames with the tokenizer's PAD, which
     # for Qwen is a different id (3 is '$' there): use the same token here.
     generator.zero_text_code = runtime.tokenizer.padding_id
-    generator.load_voice_prompt(str(sample.voice_prompt_wav))
+    voice_codes = runtime.codec.encode_voice_prompt(sample.voice_prompt_wav)
     generator.text_prompt_tokens = encode_system_prompt(runtime.tokenizer, sample.text_prompt, config.text_prompt_template)
     user_codes = runtime.codec.encode_conversation(sample.conversation_wav, sample.user_channel, sample.window_start_sec, sample.window_end_sec)
     user = torch.tensor(user_codes, device=config.device).unsqueeze(0)
@@ -169,7 +189,7 @@ def generate(
     try:
         with torch.no_grad(), autocast, graph_guard, runtime.codec.mimi.streaming(1), generator.streaming(1):
             align_generator_with_training(generator)
-            generator.step_system_prompts(runtime.codec.mimi)
+            step_training_system_prompts(generator, voice_codes, config.device)
             for frame in range(user.shape[-1]):
                 tokens = generator.step(input_tokens=user[:, :, frame : frame + 1])
                 if tokens is None:

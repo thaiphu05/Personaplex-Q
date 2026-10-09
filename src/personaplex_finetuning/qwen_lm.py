@@ -24,9 +24,6 @@ class QwenLMOutput:
     mask: torch.Tensor  # [B, K, T]
     text_logits: torch.Tensor  # [B, 1, T, text_card]
     text_mask: torch.Tensor  # [B, 1, T]
-    # Agent CB0 predicted straight from the Qwen hidden state (auxiliary head).
-    cb0_logits: Optional[torch.Tensor] = None  # [B, 1, T, card]
-    cb0_mask: Optional[torch.Tensor] = None  # [B, 1, T]
 
 
 def _delay_sequence(delays: list[int], tensor: torch.Tensor, padding: torch.Tensor) -> torch.Tensor:
@@ -80,6 +77,75 @@ class ZeroEmbedding(nn.Embedding):
         return torch.where(is_zero[..., None], torch.zeros_like(out), out)
 
 
+def _rms(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """Scale-free RMS normalization (no learned gain) in float32."""
+    x32 = x.float()
+    return x32 * torch.rsqrt(x32.pow(2).mean(dim=-1, keepdim=True) + eps)
+
+
+class StreamGains(nn.Module):
+    """Combine text, agent-audio and user-audio embeddings at a learned balance.
+
+    Each audio group sum is RMS-normalized, so its weight in the backbone input
+    is set by one learned gain instead of drifting with the embedding tables
+    during training. Gains start at the RMS of a text embedding, putting both
+    audio groups level with the text stream.
+    """
+
+    def __init__(self, text_rms: float) -> None:
+        super().__init__()
+        self.gains = nn.Parameter(torch.tensor([1.0, text_rms, text_rms], dtype=torch.float32))
+
+    def forward(self, text: torch.Tensor, agent: torch.Tensor, user: torch.Tensor) -> torch.Tensor:
+        text_gain, agent_gain, user_gain = self.gains
+        mixed = text_gain * text.float() + agent_gain * _rms(agent) + user_gain * _rms(user)
+        return mixed.to(text.dtype)
+
+
+class HiddenLayerMix(nn.Module):
+    """Softmax-weighted mix of every backbone hidden state (embeddings + layers).
+
+    The last layer of a text LM specializes in next-token prediction; earlier
+    layers keep more acoustic and positional detail. Intermediate states are
+    raw residual streams, so each passes through the backbone's own final norm
+    (the last state already has it) before mixing. Starts as a uniform average.
+    """
+
+    def __init__(self, num_states: int) -> None:
+        super().__init__()
+        self.weights = nn.Parameter(torch.zeros(num_states, dtype=torch.float32))
+
+    def forward(self, hidden_states, final_norm: nn.Module) -> torch.Tensor:
+        if len(hidden_states) != self.weights.numel():
+            raise RuntimeError(
+                f"backbone returned {len(hidden_states)} hidden states, layer mix expects {self.weights.numel()}"
+            )
+        probs = torch.softmax(self.weights, dim=0)
+        last = len(hidden_states) - 1
+        mixed = None
+        for index, state in enumerate(hidden_states):
+            normed = state if index == last else final_norm(state)
+            term = probs[index] * normed.float()
+            mixed = term if mixed is None else mixed + term
+        return mixed.to(hidden_states[-1].dtype)
+
+
+def _pca_init(table: torch.Tensor, dim: int) -> torch.Tensor:
+    """Project a pretrained embedding table onto its top ``dim`` principal axes.
+
+    Keeps the relative geometry between codes (which codes sound alike) while
+    changing the width, then rescales to unit per-element RMS.
+    """
+    weight = table.detach().float()
+    centered = weight - weight.mean(dim=0, keepdim=True)
+    _, _, vh = torch.linalg.svd(centered, full_matrices=False)
+    rank = min(dim, vh.shape[0])
+    projected = centered @ vh[:rank].T
+    out = torch.zeros(weight.shape[0], dim, device=weight.device)
+    out[:, :rank] = projected
+    return out / out.pow(2).mean().sqrt().clamp_min(1e-12)
+
+
 class QwenMoshiLM(nn.Module):
     """PersonaPlex-style 17-stream model with a frozen Qwen backbone.
 
@@ -88,8 +154,9 @@ class QwenMoshiLM(nn.Module):
     consumes the summed embeddings; its hidden state is mapped into the Helium
     context space (``backbone_proj`` + the grafted Helium ``out_norm``) so the
     grafted ``depformer_in`` and depth transformer see the input they were
-    trained on. ``cb0_head`` predicts the agent semantic codebook directly from
-    the Qwen hidden state, giving the backbone a direct audio training signal.
+    trained on. As in the Cohere TinyAya+Moshi recipe, the agent semantic
+    codebook (CB0) is predicted only by ``cb0_head`` on the Qwen hidden state;
+    the depth transformer refines the remaining codebooks conditioned on it.
     """
 
     def __init__(
@@ -112,6 +179,8 @@ class QwenMoshiLM(nn.Module):
         depformer_weights_per_step_schedule: Optional[list[int]] = None,
         out_norm: Optional[nn.Module] = None,
         context_dim: Optional[int] = None,
+        audio_emb_init: Optional[list[torch.Tensor]] = None,
+        num_hidden_states: Optional[int] = None,
         device=None,
         dtype: torch.dtype = torch.bfloat16,
     ):
@@ -136,18 +205,38 @@ class QwenMoshiLM(nn.Module):
         # Incremental KV-cache decoding state (LMGen feeds one frame per call).
         self._hf_cache = None
         self._cache_streaming = False
+        # Backbone feature of the newest frame; forward_depformer step 0 turns
+        # it into CB0 logits once the frame's text token is known.
+        self._last_cb0_hidden: Optional[torch.Tensor] = None
 
         factory_kwargs = {"device": device, "dtype": dtype}
         self.emb = nn.ModuleList(
             [ZeroEmbedding(card + 1, dim, zero_idx=self.zero_token_id, **factory_kwargs) for _ in range(n_q)]
         )
-        # nn.Embedding defaults to N(0, 1); summed over n_q streams that is ~100x
-        # the Qwen token embeddings and drowns the text stream. Match the sum of
-        # all audio streams to the scale of a single text embedding instead.
-        # Strided rows estimate the std without a full fp32 copy of the table.
-        text_std = float(self._text_embedding().weight.detach()[::16].float().std())
-        for table in self.emb:
-            nn.init.normal_(table.weight, std=text_std / n_q**0.5)
+        if audio_emb_init is not None:
+            # Reuse the code geometry Helium learned from ~7M hours of audio.
+            if len(audio_emb_init) != n_q:
+                raise ValueError(f"audio_emb_init needs {n_q} tables, got {len(audio_emb_init)}")
+            with torch.no_grad():
+                for table, source in zip(self.emb, audio_emb_init):
+                    if source.shape[0] != card + 1:
+                        raise ValueError(f"audio_emb_init table has {source.shape[0]} rows, expected {card + 1}")
+                    table.weight.copy_(_pca_init(source.to(table.weight.device), dim).to(table.weight.dtype))
+        # Audio groups are RMS-normalized in embed_codes, so table scale does not
+        # set their weight; StreamGains does, starting level with a text token.
+        # Strided rows estimate the RMS without a full fp32 copy of the table.
+        text_rms = float(self._text_embedding().weight.detach()[::16].float().pow(2).mean().sqrt())
+        self.stream_gains = StreamGains(text_rms).to(device)
+
+        if num_hidden_states is None:
+            config = getattr(qwen, "config", None)
+            layers = getattr(config, "num_hidden_layers", None)
+            if layers is None:
+                layers = getattr(getattr(config, "text_config", None), "num_hidden_layers", None)
+            if layers is None:
+                raise ValueError("cannot infer the backbone layer count; pass num_hidden_states")
+            num_hidden_states = int(layers) + 1  # embeddings + every decoder layer
+        self.layer_mix = HiddenLayerMix(num_hidden_states).to(device)
 
         if depformer_in is not None:
             context_dim = int(depformer_in[0].in_features)
@@ -167,6 +256,10 @@ class QwenMoshiLM(nn.Module):
             out_norm = nn.RMSNorm(context_dim, **factory_kwargs)
         self.out_norm = out_norm
         self.cb0_head = nn.Linear(dim, card, bias=False, **factory_kwargs)
+        # Conditions CB0 on the frame's text token, as the native depformer step 0
+        # did. Zero init: training starts from the unconditioned head.
+        self.cb0_text_adapter = nn.Linear(dim, dim, bias=False, **factory_kwargs)
+        nn.init.zeros_(self.cb0_text_adapter.weight)
         if depformer_emb is None:
             depformer_emb = nn.ModuleList(
                 [ZeroEmbedding(card + 1, depformer_dim, zero_idx=self.zero_token_id, **factory_kwargs) for _ in range(dep_q - 1)]
@@ -246,19 +339,37 @@ class QwenMoshiLM(nn.Module):
         return torch.where(is_zero[..., None], torch.zeros_like(out), out)
 
     def embed_codes(self, sequence: torch.Tensor) -> torch.Tensor:
-        """Sum the embeddings of all 17 streams, as the Helium model did."""
+        """Combine the 17 streams: text + normalized agent sum + normalized user sum."""
         B, K, S = sequence.shape
         if K != self.num_codebooks:
             raise ValueError(f"Sequence shape {sequence.shape} must match the number of codebooks.")
-        input_ = None
-        for cb_index in range(self.num_audio_codebooks):
-            audio_emb = self.emb[cb_index](sequence[:, cb_index + self.audio_offset])
-            input_ = audio_emb if input_ is None else input_ + audio_emb
-        text_emb = self._embed_text(sequence[:, 0])
-        return text_emb if input_ is None else input_ + text_emb
+        agent_codebooks = self.num_audio_codebooks // 2
+        groups = []
+        for start, end in ((0, agent_codebooks), (agent_codebooks, self.num_audio_codebooks)):
+            total = None
+            for cb_index in range(start, end):
+                audio_emb = self.emb[cb_index](sequence[:, cb_index + self.audio_offset])
+                total = audio_emb if total is None else total + audio_emb
+            groups.append(total)
+        return self.stream_gains(self._embed_text(sequence[:, 0]), *groups)
+
+    def _decoder(self) -> nn.Module:
+        """The Qwen decoder stack (without ``lm_head``)."""
+        if hasattr(self.qwen, "get_decoder"):
+            return self.qwen.get_decoder()
+        return self.qwen.model
+
+    def _final_norm(self) -> nn.Module:
+        """The backbone's own output norm, reused to scale intermediate states."""
+        norm = getattr(self._decoder(), "norm", None)
+        return norm if norm is not None else nn.Identity()
 
     def _backbone(self, input: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Run the frozen Qwen decoder; return its hidden state and text logits.
+        """Run the frozen Qwen decoder; return the audio feature and text logits.
+
+        Text logits come from the last layer through ``lm_head``; the audio
+        feature (for ``cb0_head`` and the depth context) is the learned mix of
+        every hidden state.
 
         When ``start_streaming_caches`` was called, successive single-frame calls
         reuse the Hugging Face KV cache so the model keeps dialogue context.
@@ -268,20 +379,35 @@ class QwenMoshiLM(nn.Module):
             if self._hf_cache is not None:
                 kwargs["past_key_values"] = self._hf_cache
             kwargs["use_cache"] = True
-        outputs = self.qwen(inputs_embeds=input, **kwargs)
+        # Call the decoder directly: its last_hidden_state is always the final
+        # normalized output, whatever a transformers version puts last in
+        # ``hidden_states``.
+        outputs = self._decoder()(inputs_embeds=input, **kwargs)
         if self._cache_streaming:
             self._hf_cache = outputs.past_key_values
-        hidden = outputs.hidden_states[-1]
-        text_logits = self.qwen.lm_head(hidden)
+        last = outputs.last_hidden_state
+        text_logits = self.qwen.lm_head(last)
+        states = (*outputs.hidden_states[:-1], last)
+        hidden = self.layer_mix(states, self._final_norm())
         return hidden, text_logits[:, None]
+
+    def cb0_logits(self, hidden: torch.Tensor, text_tokens: torch.Tensor) -> torch.Tensor:
+        """Agent CB0 logits from the backbone feature and the frame's text token."""
+        return self.cb0_head(hidden + self.cb0_text_adapter(self._embed_text(text_tokens)))
 
     def depth_context(self, hidden: torch.Tensor) -> torch.Tensor:
         """Map the Qwen hidden state into the normalized Helium context space."""
         return self.out_norm(self.backbone_proj(hidden))
 
     def forward_embeddings(self, input: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """LMGen entry point: depth context (Helium space) and text logits."""
+        """LMGen entry point: depth context (Helium space) and text logits.
+
+        LMGen only forwards the depth context to the depformer, so the newest
+        frame's feature is kept for ``forward_depformer`` step 0, which also
+        receives that frame's text token.
+        """
         hidden, text_logits = self._backbone(input)
+        self._last_cb0_hidden = hidden[:, -1:]
         return self.depth_context(hidden), text_logits
 
     def start_streaming_caches(self) -> None:
@@ -297,8 +423,14 @@ class QwenMoshiLM(nn.Module):
     def forward_codes(self, sequence: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         return self.forward_embeddings(self.embed_codes(sequence))
 
-    def forward_depformer_training(self, sequence: torch.Tensor, transformer_out: torch.Tensor) -> torch.Tensor:
-        """Run the depth transformer over all codebooks at once (training mode)."""
+    def forward_depformer_training(
+        self, sequence: torch.Tensor, transformer_out: torch.Tensor, cb0_logits: torch.Tensor
+    ) -> torch.Tensor:
+        """Run the depth transformer over all codebooks at once (training mode).
+
+        Step 0 still runs (later steps attend to it), but its prediction is
+        ``cb0_logits`` from the backbone head instead of ``linears[0]``.
+        """
         B, K, T = sequence.shape
         Ka = self.dep_q
         if K != self.num_codebooks:
@@ -318,11 +450,11 @@ class QwenMoshiLM(nn.Module):
         # depformer_input is [B, T, K, depformer_dim], reshaping to [B * T, K, D]
         depformer_input = depformer_input.view(B * T, Ka, -1)
         depformer_output = self.depformer(depformer_input)
-        all_logits = []
-        for cb_index in range(Ka):
+        all_logits = [cb0_logits]
+        for cb_index in range(1, Ka):
             logits = self.linears[cb_index](depformer_output[:, cb_index])
             all_logits.append(logits.view(B, T, -1))
-        logits = torch.stack(all_logits, 1)
+        logits = torch.stack([step.to(cb0_logits.dtype) for step in all_logits], 1)
         if logits.dim() != 4:  # [B, Ka, T, card]
             raise RuntimeError(f"unexpected depformer logits shape {logits.shape}")
         return logits
@@ -348,8 +480,14 @@ class QwenMoshiLM(nn.Module):
         else:
             last_token_input = self.depformer_emb[depformer_cb_index - 1](sequence[:, 0])
         depformer_input = depformer_input + last_token_input
+        # Always run the depformer step: later codebooks attend to its state.
         dep_output = self.depformer(depformer_input)
-        logits = self.linears[depformer_cb_index](dep_output)
+        if depformer_cb_index == 0:
+            if self._last_cb0_hidden is None:
+                raise RuntimeError("forward_embeddings must run before depformer step 0 (CB0 comes from cb0_head)")
+            logits = self.cb0_logits(self._last_cb0_hidden, sequence[:, 0])
+        else:
+            logits = self.linears[depformer_cb_index](dep_output)
         logits = logits[:, None]
         if logits.dim() != 4:  # [B, Ka, S, card]
             raise RuntimeError(f"unexpected depformer logits shape {logits.shape}")
@@ -365,8 +503,10 @@ class QwenMoshiLM(nn.Module):
         delayed_codes = torch.cat([initial, delayed_codes], dim=2)
 
         hidden, text_logits = self._backbone(self.embed_codes(delayed_codes[:, :, :-1]))
-        logits = self.forward_depformer_training(delayed_codes[:, :, 1:], self.depth_context(hidden))
-        cb0_logits = self.cb0_head(hidden)[:, None]
+        targets_in = delayed_codes[:, :, 1:]  # text has no delay: targets_in[:, 0] is the frame's text
+        logits = self.forward_depformer_training(
+            targets_in, self.depth_context(hidden), self.cb0_logits(hidden, targets_in[:, 0])
+        )
 
         logits, logits_mask = _undelay_sequence(
             self.delays[self.audio_offset : self.audio_offset + self.dep_q], logits, fill_value=float("nan")
@@ -374,10 +514,7 @@ class QwenMoshiLM(nn.Module):
         logits_mask &= codes[:, self.audio_offset : self.audio_offset + self.dep_q] != self.zero_token_id
         text_logits, text_logits_mask = _undelay_sequence(self.delays[:1], text_logits, fill_value=float("nan"))
         text_logits_mask &= codes[:, :1] != self.zero_token_id
-        cb0_delays = self.delays[self.audio_offset : self.audio_offset + 1]
-        cb0_logits, cb0_mask = _undelay_sequence(cb0_delays, cb0_logits, fill_value=float("nan"))
-        cb0_mask &= codes[:, self.audio_offset : self.audio_offset + 1] != self.zero_token_id
-        return QwenLMOutput(logits, logits_mask, text_logits, text_logits_mask, cb0_logits, cb0_mask)
+        return QwenLMOutput(logits, logits_mask, text_logits, text_logits_mask)
 
     def forward(self, codes: torch.Tensor) -> QwenLMOutput:
         return self.forward_train(codes)

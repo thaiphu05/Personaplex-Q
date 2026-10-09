@@ -60,7 +60,6 @@ class Config:
     epad_as_padding: bool = True
     user_loss: bool = False
     text_prompt_template: str = "native"
-    cb0_head_weight: float = 1.0
     text_loss_weight: float = 1.0
     nonsemantic_audio_weight: float = 0.02
     lr_schedule: str = "cosine"
@@ -226,9 +225,6 @@ def load_config(path: str | Path, overrides: list[str] | None = None) -> Config:
     text_loss_weight = float(raw.get("text_loss_weight", 1.0))
     if text_loss_weight < 0:
         raise ValueError("text_loss_weight must be non-negative")
-    cb0_head_weight = float(raw.get("cb0_head_weight", 1.0))
-    if cb0_head_weight < 0:
-        raise ValueError("cb0_head_weight must be non-negative")
     train_section = train if isinstance(train, dict) else {}
     lr_schedule = str(train_section.get("lr_schedule", "cosine")).lower()
     if lr_schedule not in {"cosine", "wsd"}:
@@ -285,7 +281,6 @@ def load_config(path: str | Path, overrides: list[str] | None = None) -> Config:
         epad_as_padding=epad_as_padding,
         user_loss=user_loss,
         text_prompt_template=text_prompt_template,
-        cb0_head_weight=cb0_head_weight,
         text_loss_weight=text_loss_weight,
         nonsemantic_audio_weight=nonsemantic_audio_weight,
         lr_schedule=lr_schedule,

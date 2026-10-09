@@ -244,6 +244,8 @@ def load_qwen_runtime(paths: QwenRuntimePaths, device: str = "cuda") -> PersonaP
     # Helium normalizes its hidden state before depformer_in; keeping that norm
     # lets the grafted depformer_in see the context distribution it learned.
     out_norm = _steal_pp_module(pp_model, "out_norm")
+    # Helium's audio embedding tables seed the Qwen ones (PCA to the new width).
+    helium_audio_emb = [table.weight.detach() for table in _steal_pp_module(pp_model, "emb")]
     schedule = pp_model.depformer_weights_per_step_schedule
     delays = tuple(int(delay) for delay in pp_model.delays)
     card = int(pp_model.card)
@@ -278,6 +280,12 @@ def load_qwen_runtime(paths: QwenRuntimePaths, device: str = "cuda") -> PersonaP
     if hidden_size is None:
         raise RuntimeError("cannot determine backbone hidden size from the Qwen config")
     hidden_size = int(hidden_size)
+    # Count the hidden states the decoder actually returns (embeddings + layers)
+    # instead of trusting the config across transformers versions.
+    decoder = qwen.get_decoder() if hasattr(qwen, "get_decoder") else qwen.model
+    with torch.no_grad():
+        probe = torch.zeros(1, 1, hidden_size, device=device, dtype=lm_dtype)
+        num_hidden_states = len(decoder(inputs_embeds=probe, output_hidden_states=True, return_dict=True).hidden_states)
 
     # 3. Assemble the wrapper.
     from .qwen_lm import QwenMoshiLM
@@ -299,9 +307,12 @@ def load_qwen_runtime(paths: QwenRuntimePaths, device: str = "cuda") -> PersonaP
         linears=linears,
         depformer_weights_per_step_schedule=schedule,
         out_norm=out_norm,
+        audio_emb_init=helium_audio_emb,
+        num_hidden_states=num_hidden_states,
         device=device,
         dtype=lm_dtype,
     )
+    del helium_audio_emb
     model.train()
 
     # 4. Mimi codec (frozen) for conversation encoding.

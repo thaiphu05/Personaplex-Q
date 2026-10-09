@@ -32,6 +32,9 @@ INTERFACE_NAMES = (
     "backbone_proj.",
     "out_norm.",
     "cb0_head.",
+    "cb0_text_adapter.",
+    "stream_gains.",
+    "layer_mix.",
 )
 QWEN_TRAIN_STAGES = ("interface", "joint")
 
@@ -144,8 +147,10 @@ def configure_qwen_trainable(model, ft_embed: bool = False, stage: str = "joint"
     """Freeze the Qwen core and the depth stack; keep LoRA + interface trainable.
 
     Trainable groups after this call:
-    - interface: ``backbone_proj``, ``out_norm``, ``cb0_head``, ``depformer_in``,
-      ``linears``, ``depformer_emb``, ``text_depth_adapter``
+    - interface: ``stream_gains``, ``layer_mix``, ``backbone_proj``, ``out_norm``,
+      ``cb0_head``, ``cb0_text_adapter``, ``depformer_in``,
+      ``linears`` (except ``linears.0``: CB0 comes from ``cb0_head``),
+      ``depformer_emb``, ``text_depth_adapter``
     - audio embeddings ``emb.*`` (always in the ``interface`` stage, otherwise
       when ``ft_embed`` is True)
     - ``joint`` stage only: Qwen and depth-transformer LoRA adapters
@@ -164,6 +169,9 @@ def configure_qwen_trainable(model, ft_embed: bool = False, stage: str = "joint"
             parameter.requires_grad = False
         elif name.startswith("emb."):
             parameter.requires_grad = train_emb
+        elif name.startswith("linears.0."):
+            # CB0 comes from cb0_head; the depformer's CB0 output is never used.
+            parameter.requires_grad = False
         elif name.startswith(INTERFACE_NAMES):
             parameter.requires_grad = True
         else:

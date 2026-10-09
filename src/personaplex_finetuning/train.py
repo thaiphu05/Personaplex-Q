@@ -24,6 +24,7 @@ from .lora import adapter_state_dict, inject_lora, load_adapter
 from .objective import (
     normalize_text_padding_ids,
     stream_weights_torch,
+    text_padding_mask_torch,
     torch_weighted_cross_entropy_stats,
 )
 from .peft_adapter import (
@@ -199,12 +200,12 @@ def write_tensorboard_scalars(writer, record: dict[str, float | int], trainable_
         ("loss/text", record["loss/text"]),
         ("loss/audio_semantic", record["loss/audio_semantic"]),
         ("loss/audio_nonsemantic", record["loss/audio_nonsemantic"]),
-        *((("loss/audio_cb0_head", record["loss/audio_cb0_head"]),) if "loss/audio_cb0_head" in record else ()),
         ("train/learning_rate", record["lr"]),
         ("train/gradient_norm", record["grad_norm"]),
         ("system/gpu_peak_bytes", record["gpu_peak_bytes"]),
         ("system/trainable_parameters", trainable_parameters),
         ("system/cpu_threads", cpu_threads),
+        *((name, value) for name, value in record.items() if name.startswith("diag/")),
     ):
         writer.add_scalar(name, value, step)
 
@@ -233,7 +234,6 @@ def loss_components(
     text_padding_weight: float = 0.3,
     *,
     user_loss: bool = False,
-    cb0_head_weight: float = 1.0,
     text_loss_weight: float = 1.0,
     nonsemantic_audio_weight: float = 0.02,
 ):
@@ -296,23 +296,59 @@ def loss_components(
     total = text_loss_weight * text_loss + (
         agent_semantic[0] + agent_acoustic[0] + user_semantic[0] + user_acoustic[0]
     ) / audio_denominator
-
-    # Qwen backbone: auxiliary agent-CB0 head on the backbone hidden state,
-    # supervised on the same positions and weights as the depformer's CB0.
-    cb0_logits = getattr(model_output, "cb0_logits", None)
-    if cb0_logits is not None:
-        cb0_mask = model_output.cb0_mask
-        if cb0_mask.ndim == 3:
-            cb0_mask = cb0_mask[0, 0]
-        cb0_stats = torch_weighted_cross_entropy_stats(
-            cb0_logits.reshape(-1, cb0_logits.shape[-1]),
-            audio_target[0].reshape(-1),
-            (weights[1] * cb0_mask.to(weights.dtype)).reshape(-1),
-        )
-        cb0_loss = cb0_stats[0] / cb0_stats[1].clamp_min(1e-12)
-        components["audio_cb0_head"] = cb0_loss
-        total = total + cb0_head_weight * cb0_loss
     return total, components
+
+
+def diagnostic_stats(model_output, example, text_padding_id, torch_module) -> tuple[list[str], "torch.Tensor"]:
+    """Unweighted per-token diagnostics, returned as ``(names, [N, 2])`` sum/count pairs.
+
+    The weighted losses hide what the model learned: PAD dominates the text
+    loss and ``audio_semantic`` shares its denominator with the acoustic
+    codebooks. These are the plain cross entropies and accuracies on agent
+    targets. Sums and counts stay separate so ranks and samples aggregate by
+    token count; ``diagnostic_means`` turns them into values.
+    """
+    import torch.nn.functional as functional
+
+    with torch_module.no_grad():
+        labels = torch_module.tensor(example.labels, dtype=torch_module.long, device=model_output.logits.device)
+        loss_mask = torch_module.tensor(example.loss_mask, dtype=torch_module.bool, device=labels.device)
+        names: list[str] = []
+        rows: list["torch.Tensor"] = []
+
+        def add(name: str, logits, targets, valid) -> None:
+            logits = logits[valid].float()
+            targets = targets[valid]
+            count = torch_module.tensor(float(targets.numel()), device=labels.device)
+            if targets.numel():
+                ce = functional.cross_entropy(logits, targets, reduction="sum")
+                hits = (logits.argmax(dim=-1) == targets).float().sum()
+            else:
+                ce = hits = torch_module.zeros((), device=labels.device)
+            names.extend([f"{name}_ce", f"{name}_acc"])
+            rows.extend([torch_module.stack([ce, count]), torch_module.stack([hits, count])])
+
+        text_mask = model_output.text_mask.reshape(-1)
+        text_valid = loss_mask[0] & text_mask
+        is_pad = text_padding_mask_torch(labels[0], text_padding_id)
+        text_logits = model_output.text_logits.reshape(-1, model_output.text_logits.shape[-1])
+        add("text_word", text_logits, labels[0], text_valid & ~is_pad)
+        add("text_pad", text_logits, labels[0], text_valid & is_pad)
+
+        audio_mask = model_output.mask.reshape(-1, model_output.mask.shape[-1])
+        for k in range(8):
+            valid = loss_mask[1 + k] & audio_mask[k]
+            add(f"agent_cb{k}", model_output.logits[0, k], labels[1 + k], valid)
+        return names, torch_module.stack(rows)
+
+
+def diagnostic_means(names: list[str], stats) -> dict[str, float]:
+    """Turn summed ``diagnostic_stats`` into ``diag/<name>`` values, skipping empty ones."""
+    return {
+        f"diag/{name}": float(total) / float(count)
+        for name, (total, count) in zip(names, stats.tolist())
+        if count > 0
+    }
 
 
 def one_step(config: Config, runtime, example, optimizer=None):
@@ -322,7 +358,7 @@ def one_step(config: Config, runtime, example, optimizer=None):
         output, codes, example,
         tokenizer_text_padding_ids(runtime.tokenizer, config.epad_as_padding), torch,
         config.first_codebook_weight_multiplier, config.text_padding_weight,
-        user_loss=config.user_loss, cb0_head_weight=config.cb0_head_weight,
+        user_loss=config.user_loss,
         text_loss_weight=config.text_loss_weight,
         nonsemantic_audio_weight=config.nonsemantic_audio_weight,
     )
@@ -434,8 +470,10 @@ def evaluate_validation(config: Config, runtime, val_samples: list, accelerator:
         return {}
     unwrapped = accelerator.unwrap_model(runtime.model)
     unwrapped.eval()
-    totals = {"total": 0.0, "text": 0.0, "semantic": 0.0, "nonsemantic": 0.0, "cb0_head": 0.0}
+    totals = {"total": 0.0, "text": 0.0, "semantic": 0.0, "nonsemantic": 0.0}
     count = 0
+    diag_names: list[str] = []
+    diag_totals = None
     device = accelerator.device
     with torch.no_grad():
         for sample_index, sample in enumerate(val_samples):
@@ -448,7 +486,7 @@ def evaluate_validation(config: Config, runtime, val_samples: list, accelerator:
                 output, codes, example,
                 tokenizer_text_padding_ids(runtime.tokenizer, config.epad_as_padding), torch,
                 config.first_codebook_weight_multiplier, config.text_padding_weight,
-                user_loss=config.user_loss, cb0_head_weight=config.cb0_head_weight,
+                user_loss=config.user_loss,
                 text_loss_weight=config.text_loss_weight,
                 nonsemantic_audio_weight=config.nonsemantic_audio_weight,
             )
@@ -456,26 +494,34 @@ def evaluate_validation(config: Config, runtime, val_samples: list, accelerator:
             totals["text"] += float(comps["text"].detach())
             totals["semantic"] += float(comps["audio_semantic"].detach())
             totals["nonsemantic"] += float(comps["audio_nonsemantic"].detach())
-            if "audio_cb0_head" in comps:
-                totals["cb0_head"] += float(comps["audio_cb0_head"].detach())
             count += 1
+            names, stats = diagnostic_stats(
+                output, example, tokenizer_text_padding_ids(runtime.tokenizer, config.epad_as_padding), torch
+            )
+            diag_names = names
+            diag_totals = stats if diag_totals is None else diag_totals + stats
     unwrapped.train()
     reduced = accelerator.reduce(
         torch.tensor(
-            [totals["total"], totals["text"], totals["semantic"], totals["nonsemantic"], totals["cb0_head"], count],
+            [totals["total"], totals["text"], totals["semantic"], totals["nonsemantic"], count],
             device=device,
         ),
         reduction="sum",
     )
-    total_count = float(reduced[5].item())
+    total_count = float(reduced[4].item())
     if total_count == 0:
         raise RuntimeError("validation has no samples after rank partitioning")
+    val_diag: dict[str, float] = {}
+    # Every rank must join the reduce; that holds only when each rank had a sample.
+    if diag_totals is not None and len(val_samples) >= accelerator.num_processes:
+        reduced_diag = accelerator.reduce(diag_totals, reduction="sum")
+        val_diag = {f"val/{name}": value for name, value in diagnostic_means(diag_names, reduced_diag).items()}
     return {
         "val/loss_total": float(reduced[0].item()) / total_count,
         "val/loss_text": float(reduced[1].item()) / total_count,
         "val/loss_audio_semantic": float(reduced[2].item()) / total_count,
         "val/loss_audio_nonsemantic": float(reduced[3].item()) / total_count,
-        **({"val/loss_audio_cb0_head": float(reduced[4].item()) / total_count} if hasattr(unwrapped, "qwen") else {}),
+        **val_diag,
     }
 
 
@@ -890,11 +936,16 @@ def run(
                     output, codes, example,
                     tokenizer_text_padding_ids(runtime.tokenizer, config.epad_as_padding), torch,
                     config.first_codebook_weight_multiplier, config.text_padding_weight,
-                    user_loss=config.user_loss, cb0_head_weight=config.cb0_head_weight,
+                    user_loss=config.user_loss,
                     text_loss_weight=config.text_loss_weight,
                     nonsemantic_audio_weight=config.nonsemantic_audio_weight,
                 )
                 accelerator.backward(total)
+                # Diagnostics only on the micro-step that gets logged.
+                diag_stats = (
+                    diagnostic_stats(output, example, tokenizer_text_padding_ids(runtime.tokenizer, config.epad_as_padding), torch)
+                    if accelerator.sync_gradients else None
+                )
 
                 grad_norm = step_optimizer_if_ready(accelerator, optimizer, scheduler, trainable)
 
@@ -907,10 +958,8 @@ def run(
             reduced_text = accelerator.reduce(components["text"], reduction="mean")
             reduced_sem = accelerator.reduce(components["audio_semantic"], reduction="mean")
             reduced_nonsem = accelerator.reduce(components["audio_nonsemantic"], reduction="mean")
-            reduced_cb0 = (
-                accelerator.reduce(components["audio_cb0_head"], reduction="mean")
-                if "audio_cb0_head" in components else None
-            )
+            diag_names, diag_values = diag_stats
+            reduced_diag = accelerator.reduce(diag_values, reduction="sum")
 
             if accelerator.is_main_process:
                 record = {
@@ -920,7 +969,7 @@ def run(
                     "loss/text": float(reduced_text.detach()),
                     "loss/audio_semantic": float(reduced_sem.detach()),
                     "loss/audio_nonsemantic": float(reduced_nonsem.detach()),
-                    **({"loss/audio_cb0_head": float(reduced_cb0.detach())} if reduced_cb0 is not None else {}),
+                    **diagnostic_means(diag_names, reduced_diag),
                     "lr": optimizer.param_groups[0]["lr"],
                     "grad_norm": grad_norm,
                     "global_batch_size": global_batch_size,

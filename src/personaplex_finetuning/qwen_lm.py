@@ -35,7 +35,8 @@ def _delay_sequence(delays: list[int], tensor: torch.Tensor, padding: torch.Tens
         assert delay >= 0
         line = tensor[:, k].roll(delay, dims=1)
         if delay > 0:
-            line[:, :delay] = padding[:, k]
+            # (B,1) broadcasts into the (B,delay) head for any batch size.
+            line[:, :delay] = padding[:, k : k + 1]
         outs.append(line)
     return torch.stack(outs, dim=1)
 
@@ -52,7 +53,10 @@ def _undelay_sequence(delays: list[int], tensor: torch.Tensor, fill_value: float
         assert delay >= 0
         line = tensor[:, k].roll(-delay, dims=1)
         if delay > 0:
-            line[:, -delay:] = fill_value
+            # NaN only exists for floating tensors; int streams keep their
+            # rolled values and rely on the cleared mask tail.
+            if tensor.is_floating_point():
+                line[:, -delay:] = fill_value
             mask[:, k, -delay:] = 0
         outs.append(line)
     return torch.stack(outs, dim=1), mask

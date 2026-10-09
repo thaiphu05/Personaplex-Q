@@ -141,8 +141,14 @@ def inject_lora(model, rank: int, alpha: float, dropout: float = 0.0, prefixes: 
     return [name for name, _, _ in targets]
 
 
+def _is_lora_weight(name: str) -> bool:
+    """Only LoRA matrix weights belong in an adapter; bias or other params
+    sharing the ``lora_a``/``lora_b`` namespace must never be saved/required."""
+    return name.endswith(".weight") and (".lora_a." in name or ".lora_b." in name)
+
+
 def adapter_state_dict(model):
-    return {name: parameter.detach().cpu() for name, parameter in model.named_parameters() if ".lora_a." in name or ".lora_b." in name}
+    return {name: parameter.detach().cpu() for name, parameter in model.named_parameters() if _is_lora_weight(name)}
 
 
 def load_adapter(model, path) -> None:
@@ -154,7 +160,7 @@ def load_adapter(model, path) -> None:
     from safetensors.torch import load_file
     state = load_file(str(path))
     model_sd = model.state_dict()
-    expected = {name for name, _ in model_sd.items() if ".lora_a." in name or ".lora_b." in name}
+    expected = {name for name, _ in model_sd.items() if _is_lora_weight(name)}
     supplied = set(state)
     missing = sorted(expected - supplied)
     unexpected = sorted(supplied - set(model_sd))

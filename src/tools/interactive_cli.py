@@ -362,6 +362,10 @@ def main() -> int:
     temp_text = args.temp_text if args.temp_text is not None else float(gen_sec.get("temp_text", 0.7))
     top_k = args.top_k if args.top_k is not None else int(gen_sec.get("top_k", 250))
     top_k_text = args.top_k_text if args.top_k_text is not None else int(gen_sec.get("top_k_text", 25))
+    text_prompt_template = str(cfg.get("text_prompt_template", "native")).lower()
+    if text_prompt_template == "auto":
+        # The interactive session runs the native PersonaPlex backbone only.
+        text_prompt_template = "native"
 
     in_dev = args.input_device or audio_sec.get("input_device")
     out_dev = args.output_device or audio_sec.get("output_device")
@@ -383,6 +387,7 @@ def main() -> int:
         temp_text=temp_text,
         top_k=top_k,
         top_k_text=top_k_text,
+        text_prompt_template=text_prompt_template,
     )
 
     # Warmup model

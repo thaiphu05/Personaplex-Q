@@ -39,6 +39,7 @@ class WebDemoApp:
         lora_alpha: int | None = None,
         default_voice_prompt: str | None = None,
         default_text_prompt: str = "You enjoy having a good conversation. You are a helpful and friendly assistant.",
+        text_prompt_template: str = "native",
     ):
         from personaplex_finetuning.session import InteractiveSession
 
@@ -51,6 +52,7 @@ class WebDemoApp:
         self.personaplex_source = personaplex_source
         self.default_voice_prompt = default_voice_prompt
         self.default_text_prompt = default_text_prompt
+        self.text_prompt_template = text_prompt_template
 
         logger.info("Initializing PersonaPlex Session for Gradio Web Demo...")
         self.session = InteractiveSession(
@@ -62,6 +64,7 @@ class WebDemoApp:
             lora_rank=self.lora_rank,
             lora_alpha=self.lora_alpha,
             use_sampling=True,
+            text_prompt_template=self.text_prompt_template,
         )
 
         logger.info("Warming up model...")
@@ -348,6 +351,10 @@ def main() -> int:
     qlora = args.qlora if args.qlora is not None else adapter_sec.get("qlora", False)
     voice_prompt = args.voice_prompt or (str(resolve_path(prompt_sec.get("voice_prompt"))) if prompt_sec.get("voice_prompt") else None)
     text_prompt = args.text_prompt or prompt_sec.get("text_prompt", "You enjoy having a good conversation. You are a helpful and friendly assistant.")
+    text_prompt_template = str(cfg.get("text_prompt_template", "native")).lower()
+    if text_prompt_template == "auto":
+        # The interactive session runs the native PersonaPlex backbone only.
+        text_prompt_template = "native"
 
     host = server_sec.get("host", args.host)
     port = server_sec.get("port", args.port)
@@ -368,6 +375,7 @@ def main() -> int:
         qlora=bool(qlora),
         default_voice_prompt=voice_prompt,
         default_text_prompt=text_prompt,
+        text_prompt_template=text_prompt_template,
     )
 
     demo = create_gradio_ui(app, preset_prompts)

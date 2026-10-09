@@ -107,6 +107,10 @@ def generate(
         temp=float(gen.get("temp", 0.8)), temp_text=float(gen.get("temp_text", 0.7)),
         top_k=int(gen.get("top_k", 250)), top_k_text=int(gen.get("top_k_text", 25)),
     )
+    # LMGen hardcodes Helium's PAD id (3) as the text token of the voice-prompt and
+    # silence frames. Training fills those frames with the tokenizer's PAD, which
+    # for Qwen is a different id (3 is '$' there): use the same token here.
+    generator.zero_text_code = runtime.tokenizer.padding_id
     generator.load_voice_prompt(str(sample.voice_prompt_wav))
     generator.text_prompt_tokens = encode_system_prompt(runtime.tokenizer, sample.text_prompt, config.text_prompt_template)
     user_codes = runtime.codec.encode_conversation(sample.conversation_wav, sample.user_channel, sample.window_start_sec, sample.window_end_sec)

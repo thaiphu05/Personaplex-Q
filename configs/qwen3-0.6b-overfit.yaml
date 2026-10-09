@@ -53,7 +53,7 @@ train:
   infer_samples: 1
 
 generation:
-  use_sampling: true
+  use_sampling: false         # greedy: the replay shows exactly what was memorized
   temp: 0.8
   temp_text: 0.7
   top_k: 250

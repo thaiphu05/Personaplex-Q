@@ -93,6 +93,19 @@ def decode_text(config: Config, runtime, token_ids: list[int]) -> str:
     return runtime.tokenizer._processor.decode_ids(token_ids)
 
 
+def align_generator_with_training(generator) -> None:
+    """Spend LMGen's first step so its frames line up with the training sequence.
+
+    LMGen's step at offset 0 overwrites the given frame with the initial token
+    and runs no model, so frame 0 is dropped: inference sees
+    ``[initial, f1, f2, ...]`` while training (``forward_train``) sees
+    ``[initial, f0, f1, ...]``. Every frame then sits one position earlier than
+    in training, and a model that memorized timing speaks one frame late. An
+    empty first step consumes offset 0, so the voice prompt starts at frame 0.
+    """
+    generator.step()
+
+
 def generate(
     config: Config,
     sample: PreparedSample,
@@ -150,6 +163,7 @@ def generate(
     graph_guard = compile_module.no_cuda_graph() if cache_streaming else contextlib.nullcontext()
     try:
         with torch.no_grad(), autocast, graph_guard, runtime.codec.mimi.streaming(1), generator.streaming(1):
+            align_generator_with_training(generator)
             generator.step_system_prompts(runtime.codec.mimi)
             for frame in range(user.shape[-1]):
                 tokens = generator.step(input_tokens=user[:, :, frame : frame + 1])

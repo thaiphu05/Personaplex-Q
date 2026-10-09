@@ -41,8 +41,15 @@ def compare_streams(train_ids, lmgen_ids, targets) -> dict:
     def rate(pairs) -> float | None:
         return sum(a == b for a, b in pairs) / frames if frames else None
 
+    # Agreement of lmgen[t] with train[t + shift]: a peak away from shift 0
+    # means the inference stream runs that many frames off the training one.
+    shifts = {}
+    for shift in range(-2, 3):
+        pairs = [(lmgen_ids[t], train_ids[t + shift]) for t in range(frames) if 0 <= t + shift < frames]
+        shifts[str(shift)] = sum(a == b for a, b in pairs) / len(pairs) if pairs else None
     return {
         "frames": frames,
+        "lmgen_vs_train_by_shift": shifts,
         "lmgen_vs_train": rate(zip(lmgen_ids, train_ids)),
         "lmgen_vs_target": rate(zip(lmgen_ids, targets)),
         "train_vs_target": rate(zip(train_ids, targets)),
@@ -70,7 +77,7 @@ def main() -> int:
 
     from personaplex_finetuning.config import load_config
     from personaplex_finetuning.data import PreparedDataset
-    from personaplex_finetuning.inference import attach_adapter, load_inference_runtime
+    from personaplex_finetuning.inference import align_generator_with_training, attach_adapter, load_inference_runtime
     from personaplex_finetuning.text_normalization import encode_system_prompt
     from personaplex_finetuning.train import build_example
     from tools.teacher_forced_decode import summarize
@@ -82,6 +89,8 @@ def main() -> int:
     parser.add_argument("--output-dir", default="outputs/parity")
     parser.add_argument("--train-voice-codes", action="store_true",
                         help="Replay the training voice-prompt codes instead of LMGen's streaming encode.")
+    parser.add_argument("--no-align", action="store_true",
+                        help="Skip align_generator_with_training (reproduces the old one-frame offset).")
     args = parser.parse_args()
 
     config = load_config(args.config)
@@ -111,7 +120,7 @@ def main() -> int:
     teacher_forced = summarize(train_out, example, filler, torch)["metrics"]
     start = int(example.prompt_frames)
     train_text_logits = train_out.text_logits[0, 0, start:].float()
-    train_cb0_logits = train_out.logits[0, 0, start:].float()
+    train_audio_logits = train_out.logits[0, :8].float()  # [8, T, card], undelayed frames
 
     lm_module = importlib.import_module("moshi.models.lm")
     compile_module = importlib.import_module("moshi.utils.compile")
@@ -140,11 +149,14 @@ def main() -> int:
     generator = make_generator()
     streams = example.input_codes
     dialogue_frames = len(streams[0]) - start
-    text_steps, cb0_steps = [], []
+    text_steps, audio_steps = [], []
     if is_qwen:
         model.start_streaming_caches()
     try:
         with torch.no_grad(), autocast(), compile_module.no_cuda_graph(), mimi.streaming(1), generator.streaming(1):
+            if not args.no_align:
+                align_generator_with_training(generator)
+            aligned_offset = int(generator._streaming_state.offset)
             if args.train_voice_codes:
                 for frame in range(len(train_voice[0])):
                     voice_frame = torch.tensor([[train_voice[k][frame]] for k in range(8)], device=device).unsqueeze(0)
@@ -155,7 +167,7 @@ def main() -> int:
             else:
                 generator.load_voice_prompt(str(sample.voice_prompt_wav))
                 generator.step_system_prompts(mimi)
-            lmgen_prompt_frames = int(generator._streaming_state.offset)
+            lmgen_prompt_frames = int(generator._streaming_state.offset) - aligned_offset
             for d in range(dialogue_frames):
                 t = start + d
                 user = torch.tensor([[streams[9 + k][t]] for k in range(8)], device=device).unsqueeze(0)
@@ -165,13 +177,13 @@ def main() -> int:
                     raise RuntimeError(f"LMGen returned no logits at dialogue frame {d}")
                 text_logits, audio_logits = logits
                 text_steps.append(text_logits[0, 0, 0].float())
-                cb0_steps.append(audio_logits[0, 0].float())
+                audio_steps.append(audio_logits[0, :8].float())
     finally:
         if is_qwen:
             model.stop_streaming_caches()
 
     lmgen_text_logits = torch.stack(text_steps)
-    lmgen_cb0_logits = torch.stack(cb0_steps)
+    lmgen_audio_logits = torch.stack(audio_steps)  # [D, 8, card], one row per LMGen step
 
     def stream_report(train_logits, lmgen_logits, targets) -> dict:
         report = compare_streams(
@@ -184,12 +196,22 @@ def main() -> int:
     result = {
         "sample_id": sample.sample_id,
         "train_voice_codes": bool(args.train_voice_codes),
+        "aligned": not args.no_align,
         "prompt_frames": {"train": start, "lmgen": lmgen_prompt_frames},
         "voice_prompt": voice_report,
         "teacher_forced": teacher_forced,
         "text": stream_report(train_text_logits, lmgen_text_logits, list(streams[0][start:])),
-        "agent_cb0": stream_report(train_cb0_logits, lmgen_cb0_logits, list(streams[1][start:])),
     }
+    # LMGen step d predicts codebook k for frame d - delay_k (CB1..7 lag one frame),
+    # while the training logits are already undelayed: align on the frame.
+    for k in range(8):
+        delay = int(model.delays[1 + k])
+        frames = dialogue_frames - delay
+        result[f"agent_cb{k}"] = stream_report(
+            train_audio_logits[k, start : start + frames],
+            lmgen_audio_logits[delay : delay + frames, k],
+            list(streams[1 + k][start : start + frames]),
+        )
     output_dir = Path(args.output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     (output_dir / "parity.json").write_text(json.dumps(result, indent=2))

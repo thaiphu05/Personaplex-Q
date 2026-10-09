@@ -35,13 +35,13 @@ data:
 train:
   output_dir: ../runs/qwen3-8B
   max_steps: 20000
-  learning_rate: 2.0e-5            # Qwen backbone LoRA (tăng từ 1e-5: text lì)
+  learning_rate: 1.0e-5            # Qwen backbone LoRA (tăng từ 1e-5: text lì)
   interface_lr: 5.0e-5             # depth I/O + adapters
   audio_embed_lr: 1.0e-4           # emb table (chỉ khi ft_embed=true)
   depformer_learning_rate: 5.0e-5  # depth LoRA (trả về mức ban đầu: audio vô nghĩa ở 5e-6)
   gradient_accumulation_steps: 8   # global batch = 1 × nGPU × 8
   warmup_steps: 100
-  eval_every_steps: 500
+  eval_every_steps: 1000
   save_every_steps: 1000
   gradient_checkpointing: false    # 8B fit thoải mái trong 180GB VRAM
   mixed_precision: bf16
@@ -60,7 +60,7 @@ lora:
 # Decode params cho inference (infer_every_steps + tools.inference_smoke)
 generation:
   use_sampling: true               # false = greedy
-  temp: 0.8                        # audio temperature
+  temp: 0.3                        # audio temperature
   temp_text: 0.7                   # text temperature
   top_k: 250                       # audio top-k
   top_k_text: 25                   # text top-k

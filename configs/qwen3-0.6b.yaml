@@ -57,3 +57,5 @@ generation:
   top_k: 250
   top_k_text: 25
   audio_silence_frame_cnt: 6
+
+text_prompt_template: auto

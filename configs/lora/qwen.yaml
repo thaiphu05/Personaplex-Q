@@ -8,7 +8,7 @@ qwen_rank: 64
 qwen_alpha: 128
 depformer_rank: 64
 depformer_alpha: 128
-qwen_targets: "q_proj,v_proj"
+qwen_targets: "q_proj,v_proj,k_proj,o_proj"
 ft_embed: true
 qlora: false
 quant_type: nf4

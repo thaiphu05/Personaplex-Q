@@ -86,7 +86,10 @@ def generate(
     model = model if model is not None else runtime.model
     if adapter is not None:
         if config.backbone == "qwen":
-            inject_qwen_lora(model, config.lora_qwen_rank, config.lora_qwen_alpha)
+            # Same LoRA surface as training, or the checkpoint keys will not match.
+            qwen_targets = getattr(config, "qwen_targets", None)
+            targets = tuple(qwen_targets.split(",")) if qwen_targets else None
+            inject_qwen_lora(model, config.lora_qwen_rank, config.lora_qwen_alpha, targets=targets)
             inject_depformer_lora(model, config.lora_depformer_rank, config.lora_depformer_alpha)
             configure_qwen_trainable(model, ft_embed=config.ft_embed)
             load_qwen_adapter(model, _adapter_file(adapter))

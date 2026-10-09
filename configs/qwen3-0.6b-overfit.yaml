@@ -1,0 +1,63 @@
+# Overfit test: Qwen3-0.6B backbone memorizes ONE fixed 30 s window.
+# Checks the whole pipeline (embedding -> Qwen -> cb0_head/depformer -> loss -> inference)
+# before any large run. Pass: diag/agent_cb0_acc and diag/text_word_acc > 0.9 by ~step 500,
+# and infer/step_000500/*/agent.wav replays the sample's agent speech.
+# Smoke:   python -m personaplex_finetuning.train --config configs/qwen3-0.6b-overfit.yaml --smoke
+# Overfit: python -m personaplex_finetuning.train --config configs/qwen3-0.6b-overfit.yaml
+defaults:
+  - model: qwen3-0.6b
+  - data: vietnamese
+  - lora: qwen
+  - train: qwen
+  - _self_
+
+seed: 42
+
+# Loss objective: same as configs/qwen3-0.6b.yaml
+first_codebook_weight_multiplier: 1.0   # semantic codebook (CB0) weight
+nonsemantic_audio_weight: 0.02          # acoustic codebooks CB1-7 (native: 0.02)
+text_padding_weight: 0.01               # PAD weight (native PersonaPlex: 0.3)
+text_loss_weight: 0.2                   # text CE multiplier relative to audio (native: 1.0)
+epad_as_padding: false                  # EPAD (word onset) keeps full weight
+user_loss: false                        # supervise user audio streams too
+
+model:
+  root: /home/voice/data/voice/personaplex-7b-v1   # PersonaPlex-7B checkpoint dir (Mimi codec + depformer graft)
+
+data:
+  prepared_dir: /home/voice/data/voice/vdt/data_ready/synthetic_500h
+  window_seconds: 30          # short window: fast steps
+  max_samples: 1              # first sample that fits; validation off, inference replays it
+  shuffle: false              # required by --smoke
+  random_crop: false          # same fixed window every step
+  prompt_aug_prob: 0.0
+  static_chunking: false
+  swap_roles_after_pass: false
+
+train:
+  output_dir: ../runs/qwen3-06b-overfit
+  # stage defaults to joint (LoRA + bridges all trainable): tests the full pipeline.
+  # Left unset so the CLI override `stage=interface` (Hydra `+train.stage`) still works.
+  max_steps: 500
+  learning_rate: 2.0e-4       # Qwen LoRA (higher than a real run to memorize fast)
+  depformer_learning_rate: 2.0e-4
+  interface_lr: 5.0e-4
+  audio_embed_lr: 5.0e-4
+  gradient_accumulation_steps: 1
+  warmup_steps: 20
+  eval_every_steps: 0
+  save_every_steps: 250
+  gradient_checkpointing: false
+  mixed_precision: bf16
+  infer_every_steps: 250
+  infer_samples: 1
+
+generation:
+  use_sampling: true
+  temp: 0.8
+  temp_text: 0.7
+  top_k: 250
+  top_k_text: 25
+  audio_silence_frame_cnt: 6
+
+text_prompt_template: auto

@@ -712,6 +712,15 @@ def run(
                 f"val kept={len(val_samples)} skipped={skipped_val} (text overflow)"
             )
 
+    # Overfit/debug runs: keep the first N samples (after the text-overflow
+    # filter, so the kept sample is always trainable) and skip validation, so
+    # periodic inference replays the memorized sample.
+    if config.max_samples is not None:
+        train_samples = train_samples[: config.max_samples]
+        val_samples = []
+        if accelerator.is_main_process:
+            print(f"[Overfit] max_samples={config.max_samples}: train={len(train_samples)}, validation off")
+
     # Inject LoRA with Stage-Wise Freezing support
     if config.backbone == "qwen":
         spec = detect_qwen_spec(runtime.model)

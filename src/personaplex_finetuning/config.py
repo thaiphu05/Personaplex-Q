@@ -45,6 +45,7 @@ class Config:
     eval_every_steps: int = 0
     save_every_steps: int = 50
     val_ratio: float = 0.05
+    max_samples: int | None = None
     random_crop: bool = False
     prompt_aug_prob: float = 0.0
     static_chunking: bool = False
@@ -219,6 +220,11 @@ def load_config(path: str | Path, overrides: list[str] | None = None) -> Config:
         raise ValueError("text_prompt_template must be auto, native, or qwen")
     if text_prompt_template == "auto":
         text_prompt_template = "qwen" if backbone == "qwen" else "native"
+    max_samples = data.get("max_samples")
+    if max_samples is not None:
+        max_samples = int(max_samples)
+        if max_samples < 1:
+            raise ValueError("data.max_samples must be at least 1")
     nonsemantic_audio_weight = float(raw.get("nonsemantic_audio_weight", 0.02))
     if not 0 <= nonsemantic_audio_weight <= 1:
         raise ValueError("nonsemantic_audio_weight must be within [0, 1]")
@@ -266,6 +272,7 @@ def load_config(path: str | Path, overrides: list[str] | None = None) -> Config:
         eval_every_steps=max(0, int(train.get("eval_every_steps", 0))) if isinstance(train, dict) else 0,
         save_every_steps=max(1, int(train.get("save_every_steps", 50))) if isinstance(train, dict) else 50,
         val_ratio=float(data.get("val_ratio", 0.05)),
+        max_samples=max_samples,
         random_crop=bool(data.get("random_crop", False)),
         prompt_aug_prob=float(data.get("prompt_aug_prob", 0.0)),
         static_chunking=bool(data.get("static_chunking", False)),

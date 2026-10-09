@@ -60,6 +60,39 @@ def _prepare_input_audio(input_file: Path, output_dir: Path) -> Path:
     return normalized_path
 
 
+def load_inference_runtime(config: Config):
+    """Load the runtime (backbone, codec, tokenizer) for the configured backbone."""
+    if config.backbone == "qwen":
+        return load_qwen_runtime(
+            QwenRuntimePaths(config.model_root, config.personaplex_source, config.qwen_model_id),
+            str(config.device),
+        )
+    return load_runtime(RuntimePaths(config.model_root, config.personaplex_source), config.device, config.qlora, config.quant_type)
+
+
+def attach_adapter(config: Config, model, adapter: Path) -> None:
+    """Wrap ``model`` with the training-time LoRA surface and load ``adapter``."""
+    if config.backbone == "qwen":
+        # Same LoRA surface as training, or the checkpoint keys will not match.
+        qwen_targets = getattr(config, "qwen_targets", None)
+        targets = tuple(qwen_targets.split(",")) if qwen_targets else None
+        inject_qwen_lora(model, config.lora_qwen_rank, config.lora_qwen_alpha, targets=targets)
+        inject_depformer_lora(model, config.lora_depformer_rank, config.lora_depformer_alpha)
+        configure_qwen_trainable(model, ft_embed=config.ft_embed)
+        load_qwen_adapter(model, _adapter_file(adapter))
+    else:
+        inject_lora(model, config.lora_rank, config.lora_alpha)
+        load_adapter(model, adapter)
+
+
+def decode_text(config: Config, runtime, token_ids: list[int]) -> str:
+    """Decode agent text tokens with the backbone's tokenizer."""
+    if config.backbone == "qwen":
+        return runtime.tokenizer._tokenizer.decode(token_ids)
+    # SentencePiece decode_ids merges multi-byte tokens into clean Vietnamese text
+    return runtime.tokenizer._processor.decode_ids(token_ids)
+
+
 def generate(
     config: Config,
     sample: PreparedSample,
@@ -76,26 +109,10 @@ def generate(
     import torch
 
     if runtime is None:
-        if config.backbone == "qwen":
-            runtime = load_qwen_runtime(
-                QwenRuntimePaths(config.model_root, config.personaplex_source, config.qwen_model_id),
-                str(config.device),
-            )
-        else:
-            runtime = load_runtime(RuntimePaths(config.model_root, config.personaplex_source), config.device, config.qlora, config.quant_type)
+        runtime = load_inference_runtime(config)
     model = model if model is not None else runtime.model
     if adapter is not None:
-        if config.backbone == "qwen":
-            # Same LoRA surface as training, or the checkpoint keys will not match.
-            qwen_targets = getattr(config, "qwen_targets", None)
-            targets = tuple(qwen_targets.split(",")) if qwen_targets else None
-            inject_qwen_lora(model, config.lora_qwen_rank, config.lora_qwen_alpha, targets=targets)
-            inject_depformer_lora(model, config.lora_depformer_rank, config.lora_depformer_alpha)
-            configure_qwen_trainable(model, ft_embed=config.ft_embed)
-            load_qwen_adapter(model, _adapter_file(adapter))
-        else:
-            inject_lora(model, config.lora_rank, config.lora_alpha)
-            load_adapter(model, adapter)
+        attach_adapter(config, model, adapter)
     model.eval()
     cache_streaming = config.backbone == "qwen"
     if cache_streaming:
@@ -152,12 +169,7 @@ def generate(
         raise RuntimeError("generation produced no frames")
     output_wav.parent.mkdir(parents=True, exist_ok=True)
     sphn.write_wav(str(output_wav), np.ascontiguousarray(np.concatenate(pcm_frames)), runtime.codec.sample_rate)
-    if config.backbone == "qwen":
-        cleaned_text = runtime.tokenizer._tokenizer.decode(text_token_ids)
-    else:
-        # SentencePiece decode_ids merges multi-byte tokens into clean Vietnamese text
-        cleaned_text = runtime.tokenizer._processor.decode_ids(text_token_ids)
-    output_text.write_text(cleaned_text, encoding="utf-8")
+    output_text.write_text(decode_text(config, runtime, text_token_ids), encoding="utf-8")
 
 
 def _export_context(sample: PreparedSample, output_dir: Path) -> None:

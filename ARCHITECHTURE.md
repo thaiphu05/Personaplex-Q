@@ -40,6 +40,8 @@ Text và CB0 không trễ. CB1–7 trễ 1 frame. Model quyết định "nói g�
   loss mask   = False ──────────────────────────────── True
 ```
 
+Trong vùng prompt, "sine" (audio user) và "im lặng" (audio agent sau giọng mẫu) là **bộ 8 mã cố định** `SINE_TOKENS` / `SILENCE_TOKENS` ([src/moshi/models/lm.py](src/moshi/models/lm.py)), lặp lại mỗi frame. Text ở các frame voice prompt / pause là PAD của tokenizer. Đây đúng là những gì LMGen đưa vào lúc inference và cách reference PersonaPlex finetune làm. Mọi khác biệt ở vùng này giữa train và inference đều làm model trượt khi sinh tự do.
+
 ---
 
 ## 2. Phiên bản A: PersonaPlex gốc (backbone Helium)

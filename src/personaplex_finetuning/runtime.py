@@ -79,8 +79,6 @@ class MimiCodec:
         self.device = device
         self._helpers = lm_helpers
         self._voice_cache: dict[str, tuple[tuple[int, ...], ...]] = {}
-        self._sine_cache: dict[int, tuple[tuple[int, ...], ...]] = {}
-        self._silence_cache: dict[int, tuple[tuple[int, ...], ...]] = {}
         self._cache_dir = cache_dir  # Optional persistent disk cache for conversation encoding
 
     def encode_conversation_stereo(self, path: Path, agent_channel: int, user_channel: int, start_sec: float, end_sec: float):
@@ -149,23 +147,26 @@ class MimiCodec:
         return codes
 
     def sine(self, frames: int):
-        if frames in self._sine_cache:
-            return self._sine_cache[frames]
-        import numpy as np
-        import torch
-        duration = frames / self.frame_rate
-        codes = self._encode(self._helpers.create_sinewave(duration, self.sample_rate)[None, :], torch)
-        self._sine_cache[frames] = codes
-        return codes
+        """User placeholder for the prompt frames: LMGen's fixed sine tokens.
+
+        Inference (LMGen) and the reference PersonaPlex finetune fill these
+        frames with the constant ``SINE_TOKENS``; encoding a real sine wave
+        through Mimi yields different, frame-varying codes, so the trained
+        prompt context would not match the one seen at inference.
+        """
+        return self._constant_frames(self._helpers.SINE_TOKENS, frames)
 
     def silence(self, frames: int):
-        if frames in self._silence_cache:
-            return self._silence_cache[frames]
-        import numpy as np
-        import torch
-        codes = self._encode(np.zeros((1, int(frames * self.sample_rate / self.frame_rate)), dtype=np.float32), torch)
-        self._silence_cache[frames] = codes
-        return codes
+        """Agent silence for the prompt frames: LMGen's fixed ``SILENCE_TOKENS``."""
+        return self._constant_frames(self._helpers.SILENCE_TOKENS, frames)
+
+    def _constant_frames(self, tokens, frames: int):
+        if frames < 0:
+            raise ValueError("frames must be non-negative")
+        codes = [int(token) for token in tokens]
+        if len(codes) != self.codebooks:
+            raise ValueError(f"expected {self.codebooks} prompt tokens, got {len(codes)}")
+        return tuple((code,) * frames for code in codes)
 
     def _encode(self, audio, torch):
         with torch.no_grad():

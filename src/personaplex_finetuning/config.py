@@ -46,6 +46,8 @@ class Config:
     save_every_steps: int = 50
     val_ratio: float = 0.05
     max_samples: int | None = None
+    eval_manifest_path: Path | None = None
+    final_eval_samples: int = 0
     random_crop: bool = False
     prompt_aug_prob: float = 0.0
     static_chunking: bool = False
@@ -195,6 +197,11 @@ def load_config(path: str | Path, overrides: list[str] | None = None) -> Config:
         raise ValueError("lora.quant_type must be nf4 or fp4")
     val_manifest_raw = data.get("val_manifest")
     val_manifest_path = resolve(data, "val_manifest") if isinstance(val_manifest_raw, str) and val_manifest_raw else None
+    eval_manifest_raw = data.get("eval_manifest")
+    eval_manifest_path = resolve(data, "eval_manifest") if isinstance(eval_manifest_raw, str) and eval_manifest_raw else None
+    final_eval_samples = int(train.get("final_eval_samples", 0)) if isinstance(train, dict) else 0
+    if final_eval_samples < 0:
+        raise ValueError("train.final_eval_samples must be non-negative")
 
     backbone = str(model.get("backbone", "personaplex")).lower()
     if backbone not in {"personaplex", "qwen"}:
@@ -273,6 +280,8 @@ def load_config(path: str | Path, overrides: list[str] | None = None) -> Config:
         save_every_steps=max(1, int(train.get("save_every_steps", 50))) if isinstance(train, dict) else 50,
         val_ratio=float(data.get("val_ratio", 0.05)),
         max_samples=max_samples,
+        eval_manifest_path=eval_manifest_path,
+        final_eval_samples=final_eval_samples,
         random_crop=bool(data.get("random_crop", False)),
         prompt_aug_prob=float(data.get("prompt_aug_prob", 0.0)),
         static_chunking=bool(data.get("static_chunking", False)),

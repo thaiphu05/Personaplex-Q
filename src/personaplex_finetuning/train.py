@@ -564,6 +564,51 @@ def verify_reloaded_adapter(config: Config, sample, adapter: Path) -> float:
     return float(total)
 
 
+def run_final_evaluation(config: Config, runtime, model, val_samples: list, run_dir: Path, writer,
+                         step: int, checkpoint: Path | None) -> dict | None:
+    """Score the trained model on unseen samples and write ``<run>/eval``.
+
+    Samples come from ``data.eval_manifest`` when set, else this run's own
+    validation split (``val.jsonl`` or the ``val_ratio`` split), so they were
+    never trained on. Failures are logged and never fail the training run.
+    """
+    from .evaluate import evaluate_samples
+
+    if config.eval_manifest_path is not None:
+        source = str(config.eval_manifest_path)
+        samples = PreparedDataset(config.eval_manifest_path, config.window_seconds).load()
+    else:
+        source = "validation split"
+        samples = val_samples
+    samples = samples[: config.final_eval_samples]
+    if not samples:
+        tqdm.write(json.dumps({
+            "event": "final_eval_skipped",
+            "reason": "no unseen samples: set data.eval_manifest, provide val.jsonl, or set train.eval_every_steps > 0",
+        }))
+        return None
+    was_training = model.training
+    try:
+        report = evaluate_samples(
+            config, runtime, model, samples, run_dir / "eval", gen_cfg=config.generation,
+            checkpoint=str(checkpoint) if checkpoint else None, manifest=source,
+        )
+    except Exception as exc:  # evaluation must never fail a finished training run
+        tqdm.write(json.dumps({"event": "final_eval_error", "error": str(exc)}))
+        return None
+    finally:
+        model.train(was_training)
+    if writer:
+        for key, value in report["mean"].items():
+            if value is not None:
+                writer.add_scalar(f"final_eval/{key}", value, step)
+    tqdm.write(json.dumps({
+        "event": "final_eval", "count": report["count"], "failed": report["failed"],
+        "mean": report["mean"], "output": str(run_dir / "eval"),
+    }))
+    return report
+
+
 def run(
     config: Config,
     smoke: bool = False,
@@ -905,6 +950,7 @@ def run(
     last_record = None
     reload_checks: list[dict[str, float | int]] = []
     infer_outputs: list[str] = []
+    final_eval = None
     started = time.monotonic()
 
     try:
@@ -1067,6 +1113,15 @@ def run(
                     "outputs": infer_outputs[-config.infer_samples:],
                 }))
 
+        if config.final_eval_samples > 0 and not smoke:
+            accelerator.wait_for_everyone()
+            if accelerator.is_main_process:
+                final_eval = run_final_evaluation(
+                    config, runtime, accelerator.unwrap_model(runtime.model), val_samples, run_dir, writer,
+                    max_steps, saved.parent if saved else None,
+                )
+            accelerator.wait_for_everyone()
+
         if log_file:
             log_file.close()
         if progress is not None:
@@ -1090,6 +1145,7 @@ def run(
             "best_val_loss": best_val_loss if best_val_loss < float("inf") else None,
             "reload_checks": reload_checks,
             "infer_outputs": infer_outputs,
+            "final_eval": {key: final_eval[key] for key in ("count", "failed", "mean")} if final_eval else None,
         }
         (run_dir / "run.json").write_text(json.dumps(run_info, indent=2))
         report = config.path.parent.parent / "reports" / "overfit_10.md"
@@ -1103,7 +1159,8 @@ def run(
             f"- Best val loss: {best_val_loss if best_val_loss < float('inf') else 'n/a'}\n"
             f"- Peak GPU bytes: {peak}\n- Checkpoint: {saved}\n"
             f"- Best checkpoint: {best_saved}\n"
-            "- Inference outputs: run `python -m tools.inference_smoke` with this checkpoint.\n",
+            "- Evaluation: `<run>/eval/summary.json` (train.final_eval_samples), or run "
+            "`python -m personaplex_finetuning.evaluate --config <cfg> --checkpoint <run>`.\n",
             encoding="utf-8",
         )
 

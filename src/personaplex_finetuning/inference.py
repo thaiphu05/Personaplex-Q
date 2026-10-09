@@ -93,6 +93,16 @@ def decode_text(config: Config, runtime, token_ids: list[int]) -> str:
     return runtime.tokenizer._processor.decode_ids(token_ids)
 
 
+def inference_autocast(config: Config):
+    """Autocast context mirroring the training loop (some depformer weights are fp32)."""
+    import torch
+
+    precision = str(getattr(config, "mixed_precision", "bf16")).lower()
+    if str(config.device).startswith("cuda") and torch.cuda.is_available() and precision in ("bf16", "fp16"):
+        return torch.autocast("cuda", dtype=torch.bfloat16 if precision == "bf16" else torch.float16)
+    return contextlib.nullcontext()
+
+
 def align_generator_with_training(generator) -> None:
     """Spend LMGen's first step so its frames line up with the training sequence.
 
@@ -152,12 +162,7 @@ def generate(
     text_token_ids: list[int] = []
     # Mimi's decoder is causal/streaming: resetting it for every 80 ms frame
     # inserts boundary transients that sound like clicks and clipped syllables.
-    # Autocast mirrors the training loop: some depformer weights are fp32.
-    precision = str(getattr(config, "mixed_precision", "bf16")).lower()
-    if str(config.device).startswith("cuda") and torch.cuda.is_available() and precision in ("bf16", "fp16"):
-        autocast = torch.autocast("cuda", dtype=torch.bfloat16 if precision == "bf16" else torch.float16)
-    else:
-        autocast = contextlib.nullcontext()
+    autocast = inference_autocast(config)
     # A growing KV cache cannot be replayed by CUDA graphs; scope the
     # disable to generation so later calls keep their graphs.
     graph_guard = compile_module.no_cuda_graph() if cache_streaming else contextlib.nullcontext()

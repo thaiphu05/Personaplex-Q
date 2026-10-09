@@ -48,6 +48,7 @@ train:
   mixed_precision: bf16
   infer_every_steps: 1000
   infer_samples: 2
+  final_eval_samples: 5         # after training: score 5 unseen samples into <run>/eval
 
 generation:
   use_sampling: true

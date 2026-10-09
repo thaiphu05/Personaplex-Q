@@ -10,3 +10,4 @@ eval_every_steps: 500
 save_every_steps: 500
 gradient_checkpointing: true
 mixed_precision: bf16
+final_eval_samples: 5   # after training: score 5 unseen samples into <run>/eval

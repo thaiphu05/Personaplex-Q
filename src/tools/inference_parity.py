@@ -19,7 +19,6 @@ LMGen's own encoding, isolating that difference.
 from __future__ import annotations
 
 import argparse
-import contextlib
 import json
 from pathlib import Path
 
@@ -77,10 +76,15 @@ def main() -> int:
 
     from personaplex_finetuning.config import load_config
     from personaplex_finetuning.data import PreparedDataset
-    from personaplex_finetuning.inference import align_generator_with_training, attach_adapter, load_inference_runtime
+    from personaplex_finetuning.evaluate import teacher_forced_summary
+    from personaplex_finetuning.inference import (
+        align_generator_with_training,
+        attach_adapter,
+        inference_autocast,
+        load_inference_runtime,
+    )
     from personaplex_finetuning.text_normalization import encode_system_prompt
     from personaplex_finetuning.train import build_example
-    from tools.teacher_forced_decode import summarize
 
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--config", required=True)
@@ -105,11 +109,8 @@ def main() -> int:
     device = config.device
     is_qwen = config.backbone == "qwen"
 
-    precision = str(getattr(config, "mixed_precision", "bf16")).lower()
-    if str(device).startswith("cuda") and torch.cuda.is_available() and precision in ("bf16", "fp16"):
-        autocast = lambda: torch.autocast("cuda", dtype=torch.bfloat16 if precision == "bf16" else torch.float16)
-    else:
-        autocast = contextlib.nullcontext
+    def autocast():
+        return inference_autocast(config)
 
     # 1. Training path: teacher-forced forward on the training example.
     example = build_example(config, sample, runtime)
@@ -117,7 +118,7 @@ def main() -> int:
     with torch.no_grad(), autocast():
         train_out = model.forward_train(codes)
     filler = (0, runtime.tokenizer.padding_id, runtime.tokenizer.end_padding_id)
-    teacher_forced = summarize(train_out, example, filler, torch)["metrics"]
+    teacher_forced = teacher_forced_summary(train_out, example, filler, torch)["metrics"]
     start = int(example.prompt_frames)
     train_text_logits = train_out.text_logits[0, 0, start:].float()
     train_audio_logits = train_out.logits[0, :8].float()  # [8, T, card], undelayed frames

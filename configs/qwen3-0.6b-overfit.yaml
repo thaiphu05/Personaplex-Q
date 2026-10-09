@@ -51,6 +51,7 @@ train:
   mixed_precision: bf16
   infer_every_steps: 250
   infer_samples: 1
+  final_eval_samples: 0       # overfit has no unseen samples (validation is off)
 
 generation:
   use_sampling: false         # greedy: the replay shows exactly what was memorized

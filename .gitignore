@@ -13,3 +13,5 @@ configs/server.local.yaml
 *.safetensors
 *.pt
 *.ckpt
+Personaplex - Agent/*
+*.pdf

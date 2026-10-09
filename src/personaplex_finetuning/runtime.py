@@ -241,6 +241,9 @@ def load_qwen_runtime(paths: QwenRuntimePaths, device: str = "cuda") -> PersonaP
     depformer_in = _steal_pp_module(pp_model, "depformer_in")
     depformer_emb = _steal_pp_module(pp_model, "depformer_emb")
     linears = _steal_pp_module(pp_model, "linears")
+    # Helium normalizes its hidden state before depformer_in; keeping that norm
+    # lets the grafted depformer_in see the context distribution it learned.
+    out_norm = _steal_pp_module(pp_model, "out_norm")
     schedule = pp_model.depformer_weights_per_step_schedule
     delays = tuple(int(delay) for delay in pp_model.delays)
     card = int(pp_model.card)
@@ -266,24 +269,15 @@ def load_qwen_runtime(paths: QwenRuntimePaths, device: str = "cuda") -> PersonaP
     text_initial = int(pad)
 
     # Backbone hidden size varies (Qwen3-8B: 4096, Qwen3-4B: 2560,
-    # Qwen2.5-3B: 2048, Qwen3-0.6B: 1024); never assume the default.
+    # Qwen2.5-3B: 2048, Qwen3-0.6B: 1024); never assume the default. The
+    # wrapper's backbone_proj maps it into the 4096-dim Helium context that the
+    # grafted depformer_in expects, at every backbone size.
     hidden_size = getattr(qwen.config, "hidden_size", None)
     if hidden_size is None:
         hidden_size = getattr(getattr(qwen.config, "text_config", None), "hidden_size", None)
     if hidden_size is None:
         raise RuntimeError("cannot determine backbone hidden size from the Qwen config")
     hidden_size = int(hidden_size)
-
-    # depformer_in is grafted for the 4096-dim path; rebuild it fresh when the
-    # backbone hidden size differs so old 8B checkpoints stay compatible.
-    if int(depformer_in[0].in_features) != hidden_size:
-        depformer_width = int(depformer_in[0].out_features)
-        depformer_in = torch.nn.ModuleList(
-            [
-                torch.nn.Linear(hidden_size, depformer_width, bias=False, device=device, dtype=lm_dtype)
-                for _ in range(len(depformer_in))
-            ]
-        )
 
     # 3. Assemble the wrapper.
     from .qwen_lm import QwenMoshiLM
@@ -304,6 +298,7 @@ def load_qwen_runtime(paths: QwenRuntimePaths, device: str = "cuda") -> PersonaP
         depformer_emb=depformer_emb,
         linears=linears,
         depformer_weights_per_step_schedule=schedule,
+        out_norm=out_norm,
         device=device,
         dtype=lm_dtype,
     )

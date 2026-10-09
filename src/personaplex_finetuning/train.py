@@ -138,6 +138,20 @@ def get_cosine_schedule_with_warmup(optimizer, num_warmup_steps: int, num_traini
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
+def get_wsd_schedule(optimizer, num_warmup_steps: int, num_training_steps: int, decay_ratio: float):
+    """Warmup-Stable-Decay: linear warmup, flat plateau, linear decay over the tail."""
+    decay_steps = max(1, int(round(num_training_steps * decay_ratio)))
+    decay_start = max(num_warmup_steps, num_training_steps - decay_steps)
+
+    def lr_lambda(current_step: int):
+        if current_step < num_warmup_steps:
+            return float(current_step) / float(max(1, num_warmup_steps))
+        if current_step < decay_start:
+            return 1.0
+        return max(0.0, float(num_training_steps - current_step) / float(max(1, num_training_steps - decay_start)))
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+
 def enable_gradient_checkpointing(model: torch.nn.Module) -> None:
     """Enable activation checkpointing on StreamingTransformer layers without breaking streaming inference."""
     import torch.utils.checkpoint
@@ -185,6 +199,7 @@ def write_tensorboard_scalars(writer, record: dict[str, float | int], trainable_
         ("loss/text", record["loss/text"]),
         ("loss/audio_semantic", record["loss/audio_semantic"]),
         ("loss/audio_nonsemantic", record["loss/audio_nonsemantic"]),
+        *((("loss/audio_cb0_head", record["loss/audio_cb0_head"]),) if "loss/audio_cb0_head" in record else ()),
         ("train/learning_rate", record["lr"]),
         ("train/gradient_norm", record["grad_norm"]),
         ("system/gpu_peak_bytes", record["gpu_peak_bytes"]),
@@ -218,6 +233,9 @@ def loss_components(
     text_padding_weight: float = 0.3,
     *,
     user_loss: bool = False,
+    cb0_head_weight: float = 1.0,
+    text_loss_weight: float = 1.0,
+    nonsemantic_audio_weight: float = 0.02,
 ):
     """Weighted losses where all audio groups share one mean denominator.
 
@@ -231,6 +249,7 @@ def loss_components(
         labels_tensor,
         mask_tensor,
         text_padding_id,
+        nonsemantic_audio_weight=nonsemantic_audio_weight,
         text_padding_weight=text_padding_weight,
         first_codebook_weight_multiplier=first_codebook_weight_multiplier,
         user_loss=user_loss,
@@ -274,9 +293,25 @@ def loss_components(
         "audio_semantic": (agent_semantic[0] + user_semantic[0]) / audio_denominator,
         "audio_nonsemantic": (agent_acoustic[0] + user_acoustic[0]) / audio_denominator,
     }
-    total = text_loss + (
+    total = text_loss_weight * text_loss + (
         agent_semantic[0] + agent_acoustic[0] + user_semantic[0] + user_acoustic[0]
     ) / audio_denominator
+
+    # Qwen backbone: auxiliary agent-CB0 head on the backbone hidden state,
+    # supervised on the same positions and weights as the depformer's CB0.
+    cb0_logits = getattr(model_output, "cb0_logits", None)
+    if cb0_logits is not None:
+        cb0_mask = model_output.cb0_mask
+        if cb0_mask.ndim == 3:
+            cb0_mask = cb0_mask[0, 0]
+        cb0_stats = torch_weighted_cross_entropy_stats(
+            cb0_logits.reshape(-1, cb0_logits.shape[-1]),
+            audio_target[0].reshape(-1),
+            (weights[1] * cb0_mask.to(weights.dtype)).reshape(-1),
+        )
+        cb0_loss = cb0_stats[0] / cb0_stats[1].clamp_min(1e-12)
+        components["audio_cb0_head"] = cb0_loss
+        total = total + cb0_head_weight * cb0_loss
     return total, components
 
 
@@ -287,7 +322,9 @@ def one_step(config: Config, runtime, example, optimizer=None):
         output, codes, example,
         tokenizer_text_padding_ids(runtime.tokenizer, config.epad_as_padding), torch,
         config.first_codebook_weight_multiplier, config.text_padding_weight,
-        user_loss=config.user_loss,
+        user_loss=config.user_loss, cb0_head_weight=config.cb0_head_weight,
+        text_loss_weight=config.text_loss_weight,
+        nonsemantic_audio_weight=config.nonsemantic_audio_weight,
     )
     if optimizer is not None:
         optimizer.zero_grad(set_to_none=True)
@@ -361,7 +398,7 @@ def save_adapter(run_dir: Path, model, config: Config, step: int, optimizer=None
     save_file(state, str(adapter))
     (path / "adapter.json").write_text(
         json.dumps(
-            {"step": step, "model_root": str(config.model_root), "rank": config.lora_rank, "alpha": config.lora_alpha,
+            {"step": step, "train_stage": config.train_stage, "model_root": str(config.model_root), "rank": config.lora_rank, "alpha": config.lora_alpha,
              "gradient_accumulation_steps": gradient_accumulation_steps, "num_processes": num_processes},
             indent=2,
         )
@@ -382,7 +419,7 @@ def save_best_adapter(
     save_file(state, str(adapter))
     (path / "adapter.json").write_text(
         json.dumps(
-            {"step": step, "val_loss": val_loss, "model_root": str(config.model_root), "rank": config.lora_rank, "alpha": config.lora_alpha,
+            {"step": step, "val_loss": val_loss, "train_stage": config.train_stage, "model_root": str(config.model_root), "rank": config.lora_rank, "alpha": config.lora_alpha,
              "gradient_accumulation_steps": gradient_accumulation_steps, "num_processes": num_processes},
             indent=2,
         )
@@ -397,7 +434,7 @@ def evaluate_validation(config: Config, runtime, val_samples: list, accelerator:
         return {}
     unwrapped = accelerator.unwrap_model(runtime.model)
     unwrapped.eval()
-    totals = {"total": 0.0, "text": 0.0, "semantic": 0.0, "nonsemantic": 0.0}
+    totals = {"total": 0.0, "text": 0.0, "semantic": 0.0, "nonsemantic": 0.0, "cb0_head": 0.0}
     count = 0
     device = accelerator.device
     with torch.no_grad():
@@ -411,19 +448,26 @@ def evaluate_validation(config: Config, runtime, val_samples: list, accelerator:
                 output, codes, example,
                 tokenizer_text_padding_ids(runtime.tokenizer, config.epad_as_padding), torch,
                 config.first_codebook_weight_multiplier, config.text_padding_weight,
-                user_loss=config.user_loss,
+                user_loss=config.user_loss, cb0_head_weight=config.cb0_head_weight,
+                text_loss_weight=config.text_loss_weight,
+                nonsemantic_audio_weight=config.nonsemantic_audio_weight,
             )
             totals["total"] += float(total.detach())
             totals["text"] += float(comps["text"].detach())
             totals["semantic"] += float(comps["audio_semantic"].detach())
             totals["nonsemantic"] += float(comps["audio_nonsemantic"].detach())
+            if "audio_cb0_head" in comps:
+                totals["cb0_head"] += float(comps["audio_cb0_head"].detach())
             count += 1
     unwrapped.train()
     reduced = accelerator.reduce(
-        torch.tensor([totals["total"], totals["text"], totals["semantic"], totals["nonsemantic"], count], device=device),
+        torch.tensor(
+            [totals["total"], totals["text"], totals["semantic"], totals["nonsemantic"], totals["cb0_head"], count],
+            device=device,
+        ),
         reduction="sum",
     )
-    total_count = float(reduced[4].item())
+    total_count = float(reduced[5].item())
     if total_count == 0:
         raise RuntimeError("validation has no samples after rank partitioning")
     return {
@@ -431,6 +475,7 @@ def evaluate_validation(config: Config, runtime, val_samples: list, accelerator:
         "val/loss_text": float(reduced[1].item()) / total_count,
         "val/loss_audio_semantic": float(reduced[2].item()) / total_count,
         "val/loss_audio_nonsemantic": float(reduced[3].item()) / total_count,
+        **({"val/loss_audio_cb0_head": float(reduced[4].item()) / total_count} if hasattr(unwrapped, "qwen") else {}),
     }
 
 
@@ -449,7 +494,7 @@ def verify_reloaded_adapter(config: Config, sample, adapter: Path) -> float:
             targets=targets_override,
         )
         inject_depformer_lora(fresh.model, rank=config.lora_depformer_rank, alpha=config.lora_depformer_alpha)
-        configure_qwen_trainable(fresh.model, ft_embed=config.ft_embed)
+        configure_qwen_trainable(fresh.model, ft_embed=config.ft_embed, stage=config.train_stage)
         load_qwen_adapter(fresh.model, adapter)
         fresh.model.eval()
         example = build_example(config, sample, fresh)
@@ -634,10 +679,10 @@ def run(
         targets += inject_depformer_lora(
             runtime.model, rank=config.lora_depformer_rank, alpha=config.lora_depformer_alpha
         )
-        configure_qwen_trainable(runtime.model, ft_embed=config.ft_embed)
+        configure_qwen_trainable(runtime.model, ft_embed=config.ft_embed, stage=config.train_stage)
         if accelerator.is_main_process:
             print(
-                f"[Qwen Swap] family={spec.family} (config: {runtime.qwen_family}), "
+                f"[Qwen Swap] stage={config.train_stage}, family={spec.family} (config: {runtime.qwen_family}), "
                 f"lora targets={spec.lora_targets if targets_override is None else targets_override}, "
                 f"rank={config.lora_qwen_rank}, alpha={config.lora_qwen_alpha}"
             )
@@ -686,11 +731,20 @@ def run(
         meta_file = adapter_file.parent / "adapter.json"
         if meta_file.is_file():
             try:
-                adapter_resume_step = int(json.loads(meta_file.read_text(encoding="utf-8")).get("step", 0))
+                meta = json.loads(meta_file.read_text(encoding="utf-8"))
+                adapter_resume_step = int(meta.get("step", 0))
                 if accelerator.is_main_process:
                     print(f"Adapter checkpoint is at optimizer step {adapter_resume_step}")
             except Exception:
-                pass
+                meta = {}
+            checkpoint_stage = meta.get("train_stage")
+            if config.backbone == "qwen" and checkpoint_stage and checkpoint_stage != config.train_stage:
+                # A new stage trains a different parameter set: keep the
+                # weights, start a fresh optimizer, scheduler and step count.
+                resume_checkpoint_dir = None
+                adapter_resume_step = 0
+                if accelerator.is_main_process:
+                    print(f"Stage change {checkpoint_stage} -> {config.train_stage}: weights only, fresh optimizer from step 0")
 
     # Alias LMModel.forward to forward_train for training execution
     if config.backbone != "qwen":
@@ -713,8 +767,10 @@ def run(
                 lr = temp_lr
             elif name.startswith("emb."):
                 lr = config.audio_embed_lr
+            elif name.startswith("depformer."):
+                lr = dep_lr  # depth-transformer LoRA
             else:
-                lr = dep_lr
+                lr = config.interface_lr
             groups.setdefault(lr, []).append(parameter)
         optimizer = torch.optim.AdamW(
             [{"params": params, "lr": lr} for lr, params in groups.items()], weight_decay=0.0
@@ -741,7 +797,10 @@ def run(
     max_steps = 1 if smoke else config.max_steps
     scheduler = None
     if config.warmup_steps > 0 and not smoke:
-        scheduler = get_cosine_schedule_with_warmup(optimizer, config.warmup_steps, max_steps)
+        if config.lr_schedule == "wsd":
+            scheduler = get_wsd_schedule(optimizer, config.warmup_steps, max_steps, config.wsd_decay_ratio)
+        else:
+            scheduler = get_cosine_schedule_with_warmup(optimizer, config.warmup_steps, max_steps)
 
     # Prepare model, optimizer, scheduler with Accelerator (DDP wrapping)
     runtime.model, optimizer = accelerator.prepare(runtime.model, optimizer)
@@ -831,7 +890,9 @@ def run(
                     output, codes, example,
                     tokenizer_text_padding_ids(runtime.tokenizer, config.epad_as_padding), torch,
                     config.first_codebook_weight_multiplier, config.text_padding_weight,
-                    user_loss=config.user_loss,
+                    user_loss=config.user_loss, cb0_head_weight=config.cb0_head_weight,
+                    text_loss_weight=config.text_loss_weight,
+                    nonsemantic_audio_weight=config.nonsemantic_audio_weight,
                 )
                 accelerator.backward(total)
 
@@ -846,6 +907,10 @@ def run(
             reduced_text = accelerator.reduce(components["text"], reduction="mean")
             reduced_sem = accelerator.reduce(components["audio_semantic"], reduction="mean")
             reduced_nonsem = accelerator.reduce(components["audio_nonsemantic"], reduction="mean")
+            reduced_cb0 = (
+                accelerator.reduce(components["audio_cb0_head"], reduction="mean")
+                if "audio_cb0_head" in components else None
+            )
 
             if accelerator.is_main_process:
                 record = {
@@ -855,6 +920,7 @@ def run(
                     "loss/text": float(reduced_text.detach()),
                     "loss/audio_semantic": float(reduced_sem.detach()),
                     "loss/audio_nonsemantic": float(reduced_nonsem.detach()),
+                    **({"loss/audio_cb0_head": float(reduced_cb0.detach())} if reduced_cb0 is not None else {}),
                     "lr": optimizer.param_groups[0]["lr"],
                     "grad_norm": grad_norm,
                     "global_batch_size": global_batch_size,

@@ -24,7 +24,16 @@ import torch
 
 from .lora import LoRALinear
 
-INTERFACE_NAMES = ("emb.", "depformer_in.", "linears.", "depformer_emb.", "text_depth_adapter.")
+INTERFACE_NAMES = (
+    "depformer_in.",
+    "linears.",
+    "depformer_emb.",
+    "text_depth_adapter.",
+    "backbone_proj.",
+    "out_norm.",
+    "cb0_head.",
+)
+QWEN_TRAIN_STAGES = ("interface", "joint")
 
 
 @dataclass(frozen=True)
@@ -118,25 +127,43 @@ def inject_depformer_lora(model, rank: int = 64, alpha: int = 128) -> list[str]:
     return wrapped
 
 
-def configure_qwen_trainable(model, ft_embed: bool = False) -> None:
+def _is_lora(name: str) -> bool:
+    return ".lora_a." in name or ".lora_b." in name
+
+
+def _is_qwen_adapter_param(name: str) -> bool:
+    """Every parameter a Qwen-swap checkpoint owns, trainable or not.
+
+    Audio embeddings are always included: they are freshly initialized at load
+    time, so a checkpoint without them could not reproduce the trained model.
+    """
+    return _is_lora(name) or name.startswith("emb.") or name.startswith(INTERFACE_NAMES)
+
+
+def configure_qwen_trainable(model, ft_embed: bool = False, stage: str = "joint") -> None:
     """Freeze the Qwen core and the depth stack; keep LoRA + interface trainable.
 
     Trainable groups after this call:
-    - Qwen LoRA adapters (``*.lora_a.*`` / ``*.lora_b.*`` under ``qwen.``)
-    - audio embeddings ``emb.*`` when ``ft_embed`` is True
-    - depth interface: ``depformer_in``, ``linears``, ``depformer_emb``,
-      ``text_depth_adapter``
-    - depth transformer LoRA adapters (injected by ``inject_depformer_lora``)
+    - interface: ``backbone_proj``, ``out_norm``, ``cb0_head``, ``depformer_in``,
+      ``linears``, ``depformer_emb``, ``text_depth_adapter``
+    - audio embeddings ``emb.*`` (always in the ``interface`` stage, otherwise
+      when ``ft_embed`` is True)
+    - ``joint`` stage only: Qwen and depth-transformer LoRA adapters
+
+    The ``interface`` stage aligns the freshly initialized bridges with the
+    frozen backbone and the grafted depth stack before LoRA starts adapting.
     """
-    for name, parameter in model.qwen.named_parameters():
-        parameter.requires_grad = ".lora_a." in name or ".lora_b." in name
+    if stage not in QWEN_TRAIN_STAGES:
+        raise ValueError(f"qwen train stage must be one of {QWEN_TRAIN_STAGES}, got {stage!r}")
+    train_lora = stage == "joint"
+    train_emb = ft_embed or stage == "interface"
     for name, parameter in model.named_parameters():
-        if name.startswith("qwen."):
-            continue  # already handled above
-        if ".lora_a." in name or ".lora_b." in name:
-            parameter.requires_grad = True
+        if _is_lora(name):
+            parameter.requires_grad = train_lora
+        elif name.startswith("qwen."):
+            parameter.requires_grad = False
         elif name.startswith("emb."):
-            parameter.requires_grad = ft_embed
+            parameter.requires_grad = train_emb
         elif name.startswith(INTERFACE_NAMES):
             parameter.requires_grad = True
         else:
@@ -144,15 +171,15 @@ def configure_qwen_trainable(model, ft_embed: bool = False) -> None:
 
 
 def qwen_adapter_state_dict(model):
-    """Collect every trainable parameter (LoRA adapters + interface)."""
-    return {name: parameter.detach().cpu() for name, parameter in model.named_parameters() if parameter.requires_grad}
+    """Collect every adapter parameter (LoRA, interface, audio embeddings)."""
+    return {name: parameter.detach().cpu() for name, parameter in model.named_parameters() if _is_qwen_adapter_param(name)}
 
 
 def load_qwen_adapter(model, path) -> None:
     """Load a Qwen-swap checkpoint, rejecting any key mismatch."""
     from safetensors.torch import load_file
     state = load_file(str(path))
-    expected = {name for name, parameter in model.named_parameters() if parameter.requires_grad}
+    expected = {name for name, _ in model.named_parameters() if _is_qwen_adapter_param(name)}
     supplied = set(state)
     missing = sorted(expected - supplied)
     unexpected = sorted(supplied - {name for name, _ in model.named_parameters()})

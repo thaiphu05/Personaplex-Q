@@ -10,6 +10,17 @@ defaults:
 
 seed: 42
 
+# Loss objective (Cohere TinyAya+Moshi recipe): ~60-70% of text frames are PAD,
+# so PAD is nearly ignored and text is a light auxiliary next to audio.
+# total = text_loss_weight * text + audio (CB0 + acoustic, shared denominator) + cb0_head_weight * cb0_head
+first_codebook_weight_multiplier: 1.0   # semantic codebook (CB0) weight
+nonsemantic_audio_weight: 0.02          # acoustic codebooks CB1-7 (native: 0.02)
+text_padding_weight: 0.01               # PAD weight (native PersonaPlex: 0.3)
+text_loss_weight: 0.2                   # text CE multiplier relative to audio (native: 1.0)
+epad_as_padding: false                  # EPAD (word onset) keeps full weight
+user_loss: false                        # supervise user audio streams too
+cb0_head_weight: 1.0                    # auxiliary CB0 head on the Qwen hidden state
+
 model:
   root: /home/voice/data/voice/personaplex-7b-v1   # PersonaPlex-7B checkpoint dir (Mimi codec + depformer graft)
 

@@ -24,6 +24,9 @@ class QwenLMOutput:
     mask: torch.Tensor  # [B, K, T]
     text_logits: torch.Tensor  # [B, 1, T, text_card]
     text_mask: torch.Tensor  # [B, 1, T]
+    # Agent CB0 predicted straight from the Qwen hidden state (auxiliary head).
+    cb0_logits: Optional[torch.Tensor] = None  # [B, 1, T, card]
+    cb0_mask: Optional[torch.Tensor] = None  # [B, 1, T]
 
 
 def _delay_sequence(delays: list[int], tensor: torch.Tensor, padding: torch.Tensor) -> torch.Tensor:
@@ -82,8 +85,11 @@ class QwenMoshiLM(nn.Module):
 
     Streams follow the PersonaPlex layout: index 0 is agent text, 1..8 are the
     agent audio codebooks, 9..16 are the user audio codebooks. The Qwen decoder
-    consumes the summed embeddings and produces the hidden context feeding the
-    depth transformer.
+    consumes the summed embeddings; its hidden state is mapped into the Helium
+    context space (``backbone_proj`` + the grafted Helium ``out_norm``) so the
+    grafted ``depformer_in`` and depth transformer see the input they were
+    trained on. ``cb0_head`` predicts the agent semantic codebook directly from
+    the Qwen hidden state, giving the backbone a direct audio training signal.
     """
 
     def __init__(
@@ -104,6 +110,8 @@ class QwenMoshiLM(nn.Module):
         linears: Optional[nn.ModuleList] = None,
         depformer_emb: Optional[nn.ModuleList] = None,
         depformer_weights_per_step_schedule: Optional[list[int]] = None,
+        out_norm: Optional[nn.Module] = None,
+        context_dim: Optional[int] = None,
         device=None,
         dtype: torch.dtype = torch.bfloat16,
     ):
@@ -133,11 +141,32 @@ class QwenMoshiLM(nn.Module):
         self.emb = nn.ModuleList(
             [ZeroEmbedding(card + 1, dim, zero_idx=self.zero_token_id, **factory_kwargs) for _ in range(n_q)]
         )
+        # nn.Embedding defaults to N(0, 1); summed over n_q streams that is ~100x
+        # the Qwen token embeddings and drowns the text stream. Match the sum of
+        # all audio streams to the scale of a single text embedding instead.
+        # Strided rows estimate the std without a full fp32 copy of the table.
+        text_std = float(self._text_embedding().weight.detach()[::16].float().std())
+        for table in self.emb:
+            nn.init.normal_(table.weight, std=text_std / n_q**0.5)
+
+        if depformer_in is not None:
+            context_dim = int(depformer_in[0].in_features)
+        elif context_dim is None:
+            context_dim = dim
+        self.context_dim = context_dim
         if depformer_in is None:
             depformer_in = nn.ModuleList(
-                [nn.Linear(dim, depformer_dim, bias=False, **factory_kwargs) for _ in range(dep_q)]
+                [nn.Linear(context_dim, depformer_dim, bias=False, **factory_kwargs) for _ in range(dep_q)]
             )
         self.depformer_in = depformer_in
+        # Orthogonal init keeps the projection well conditioned at any width.
+        proj = nn.Linear(dim, context_dim, bias=False, device=device, dtype=torch.float32)
+        nn.init.orthogonal_(proj.weight)
+        self.backbone_proj = proj.to(dtype)
+        if out_norm is None:
+            out_norm = nn.RMSNorm(context_dim, **factory_kwargs)
+        self.out_norm = out_norm
+        self.cb0_head = nn.Linear(dim, card, bias=False, **factory_kwargs)
         if depformer_emb is None:
             depformer_emb = nn.ModuleList(
                 [ZeroEmbedding(card + 1, depformer_dim, zero_idx=self.zero_token_id, **factory_kwargs) for _ in range(dep_q - 1)]
@@ -228,8 +257,8 @@ class QwenMoshiLM(nn.Module):
         text_emb = self._embed_text(sequence[:, 0])
         return text_emb if input_ is None else input_ + text_emb
 
-    def forward_embeddings(self, input: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Run the frozen Qwen decoder; return hidden context and text logits.
+    def _backbone(self, input: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run the frozen Qwen decoder; return its hidden state and text logits.
 
         When ``start_streaming_caches`` was called, successive single-frame calls
         reuse the Hugging Face KV cache so the model keeps dialogue context.
@@ -245,6 +274,15 @@ class QwenMoshiLM(nn.Module):
         hidden = outputs.hidden_states[-1]
         text_logits = self.qwen.lm_head(hidden)
         return hidden, text_logits[:, None]
+
+    def depth_context(self, hidden: torch.Tensor) -> torch.Tensor:
+        """Map the Qwen hidden state into the normalized Helium context space."""
+        return self.out_norm(self.backbone_proj(hidden))
+
+    def forward_embeddings(self, input: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """LMGen entry point: depth context (Helium space) and text logits."""
+        hidden, text_logits = self._backbone(input)
+        return self.depth_context(hidden), text_logits
 
     def start_streaming_caches(self) -> None:
         """Enable incremental KV-cache decoding for LMGen-style single-frame calls."""
@@ -326,8 +364,9 @@ class QwenMoshiLM(nn.Module):
         delayed_codes = _delay_sequence(self.delays, codes, initial)
         delayed_codes = torch.cat([initial, delayed_codes], dim=2)
 
-        transformer_out, text_logits = self.forward_codes(delayed_codes[:, :, :-1])
-        logits = self.forward_depformer_training(delayed_codes[:, :, 1:], transformer_out)
+        hidden, text_logits = self._backbone(self.embed_codes(delayed_codes[:, :, :-1]))
+        logits = self.forward_depformer_training(delayed_codes[:, :, 1:], self.depth_context(hidden))
+        cb0_logits = self.cb0_head(hidden)[:, None]
 
         logits, logits_mask = _undelay_sequence(
             self.delays[self.audio_offset : self.audio_offset + self.dep_q], logits, fill_value=float("nan")
@@ -335,7 +374,10 @@ class QwenMoshiLM(nn.Module):
         logits_mask &= codes[:, self.audio_offset : self.audio_offset + self.dep_q] != self.zero_token_id
         text_logits, text_logits_mask = _undelay_sequence(self.delays[:1], text_logits, fill_value=float("nan"))
         text_logits_mask &= codes[:, :1] != self.zero_token_id
-        return QwenLMOutput(logits, logits_mask, text_logits, text_logits_mask)
+        cb0_delays = self.delays[self.audio_offset : self.audio_offset + 1]
+        cb0_logits, cb0_mask = _undelay_sequence(cb0_delays, cb0_logits, fill_value=float("nan"))
+        cb0_mask &= codes[:, self.audio_offset : self.audio_offset + 1] != self.zero_token_id
+        return QwenLMOutput(logits, logits_mask, text_logits, text_logits_mask, cb0_logits, cb0_mask)
 
     def forward(self, codes: torch.Tensor) -> QwenLMOutput:
         return self.forward_train(codes)

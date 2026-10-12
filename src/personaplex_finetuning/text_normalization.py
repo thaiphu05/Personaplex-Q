@@ -57,14 +57,15 @@ def encode_system_prompt(tokenizer, text: str, template: str = "native") -> list
         hf_tokenizer = getattr(tokenizer, "_tokenizer", None)
         if hf_tokenizer is None or not hasattr(hf_tokenizer, "apply_chat_template"):
             raise ValueError("text_prompt_template=qwen requires a QwenTokenizer wrapper")
+        # transformers >= 5 defaults return_dict=True and returns a BatchEncoding
+        # (a UserDict, so list() would yield its key names): ask for plain ids.
         encoded = hf_tokenizer.apply_chat_template(
             [{"role": "system", "content": text}],
             tokenize=True,
             add_generation_prompt=False,
+            return_dict=False,
         )
-        if isinstance(encoded, dict):
-            encoded = encoded["input_ids"]
-        return list(encoded)
+        return [int(token) for token in encoded]
     if template != "native":
         raise ValueError(f"unsupported text_prompt_template {template!r}; expected native or qwen")
     return list(tokenizer.encode(f"<system> {text} <system>"))

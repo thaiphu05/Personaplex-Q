@@ -9,7 +9,9 @@ val.jsonl) it writes, next to the original dialogue:
   force_text.wav/.txt  free-running, reference text forced each frame
   force_text_cb0.wav   free-running, reference text + agent CB0 forced;
                        only CB1-7 come from the depth transformer
-  metrics.json         teacher-forced accuracy per agent codebook
+  metrics.json         teacher-forced accuracy per agent codebook, overall and
+                       split into agent-speech / silence frames (``_speech``,
+                       ``_silence``; silence codes are easy and inflate the mean)
 
 Listening order ref_resynth -> force_text_cb0 -> force_text -> free shows
 which stream breaks the audio. Uses the package code unchanged.
@@ -27,7 +29,27 @@ from pathlib import Path
 
 AGENT_CODEBOOKS = 8
 MODES = ("free", "force_text", "force_text_cb0")
-MEAN_KEYS = ("text_word_acc", "agent_all_cb_acc") + tuple(f"agent_cb{k}_acc" for k in range(AGENT_CODEBOOKS))
+MEAN_KEYS = ("text_word_acc", "agent_all_cb_acc", "speech_ratio") + tuple(
+    f"agent_cb{k}_acc{suffix}" for suffix in ("", "_speech", "_silence") for k in range(AGENT_CODEBOOKS)
+)
+
+
+def speech_frame_mask(words, window_start_sec: float, frame_rate: float, frames: int) -> list[bool]:
+    """True for dialogue frames inside an agent word's ``[start, end)`` span.
+
+    Frame ``f`` covers time ``window_start + f / frame_rate``, the same origin
+    the training sequence uses to place agent text. Silence frames carry easy,
+    near-constant codes, so accuracy over them says little about speech.
+    """
+    mask = [False] * frames
+    for word in words:
+        if word.speaker != "agent":
+            continue
+        first = max(0, int((word.start - window_start_sec) * frame_rate))
+        last = min(frames, int((word.end - window_start_sec) * frame_rate + 0.999999))
+        for frame in range(first, last):
+            mask[frame] = True
+    return mask
 
 
 def per_codebook_accuracy(predicted, targets, valid) -> list[float | None]:
@@ -69,7 +91,7 @@ def _decode(runtime, codes, torch):
     return pcm.squeeze().float().cpu().numpy()
 
 
-def teacher_forced_probe(config, runtime, model, example, torch):
+def teacher_forced_probe(config, runtime, model, example, torch, sample=None):
     """Teacher-forced argmax codes, reference codes and per-codebook accuracy."""
     from personaplex_finetuning.evaluate import teacher_forced_summary
     from personaplex_finetuning.inference import inference_autocast
@@ -89,6 +111,15 @@ def teacher_forced_probe(config, runtime, model, example, torch):
     metrics = dict(summary["metrics"])
     for k, accuracy in enumerate(per_codebook_accuracy(predicted, targets, valid)):
         metrics[f"agent_cb{k}_acc"] = accuracy
+    if sample is not None:
+        speech = torch.tensor(
+            speech_frame_mask(sample.words, sample.window_start_sec, runtime.codec.frame_rate, targets.shape[-1]),
+            dtype=torch.bool, device=valid.device,
+        )
+        metrics["speech_ratio"] = float(speech.float().mean()) if speech.numel() else None
+        for suffix, part in (("_speech", speech), ("_silence", ~speech)):
+            for k, accuracy in enumerate(per_codebook_accuracy(predicted, targets, valid & part)):
+                metrics[f"agent_cb{k}_acc{suffix}"] = accuracy
     return summary["audio"], targets, metrics
 
 
@@ -203,7 +234,7 @@ def main() -> int:
         try:
             _export_context(sample, sample_dir)
             example = build_example(config, sample, runtime)
-            tf_codes, ref_codes, metrics = teacher_forced_probe(config, runtime, model, example, torch)
+            tf_codes, ref_codes, metrics = teacher_forced_probe(config, runtime, model, example, torch, sample)
             write_wav(sample_dir / "ref_resynth.wav", _decode(runtime, ref_codes, torch))
             write_wav(sample_dir / "tf_agent.wav", _decode(runtime, tf_codes, torch))
             for mode in MODES:
@@ -212,7 +243,16 @@ def main() -> int:
                 (sample_dir / f"{mode}.txt").write_text(decode_text(config, runtime, text_ids), encoding="utf-8")
             (sample_dir / "metrics.json").write_text(json.dumps(metrics, indent=2))
             results.append({"sample_id": sample.sample_id, "metrics": metrics, "error": None})
-            print(json.dumps({"sample_id": sample.sample_id, **metrics}))
+            acoustic = [metrics.get(f"agent_cb{k}_acc_speech") for k in range(1, AGENT_CODEBOOKS)]
+            acoustic = [value for value in acoustic if value is not None]
+            print(json.dumps({
+                "sample_id": sample.sample_id,
+                "speech_ratio": metrics.get("speech_ratio"),
+                "cb0_acc_speech": metrics.get("agent_cb0_acc_speech"),
+                "cb0_acc_silence": metrics.get("agent_cb0_acc_silence"),
+                "cb1_7_acc_speech": sum(acoustic) / len(acoustic) if acoustic else None,
+                "text_word_acc": metrics.get("text_word_acc"),
+            }))
         except Exception as exc:  # one bad sample must not stop the probe
             results.append({"sample_id": sample.sample_id, "metrics": None, "error": str(exc)})
             print(json.dumps({"sample_id": sample.sample_id, "error": str(exc)}))

@@ -1,0 +1,68 @@
+# Audio-quality run for Qwen3-0.6B: CB0 from both cb0_head and depth step 0
+# (gated merge, gate starts at 0) + dense FP32 fine-tuning of the depth transformer.
+# Continue an existing qwen3-0.6b checkpoint (its depformer LoRA is merged into dense
+# weights automatically; optimizer restarts because the trainable set changes):
+#   python -m personaplex_finetuning.train --config configs/qwen3-0.6b-audio.yaml --resume-from runs/<run>/checkpoints/<ckpt>
+# Compare branches with cb0_source=qwen|merge and depformer_mode=lora|full overrides.
+defaults:
+  - model: qwen3-0.6b
+  - data: vietnamese
+  - lora: qwen
+  - train: qwen
+  - _self_
+
+seed: 42
+
+# Loss objective (Cohere TinyAya+Moshi recipe): ~60-70% of text frames are PAD,
+# so PAD is nearly ignored and text is a light auxiliary next to audio.
+# total = text_loss_weight * text + audio (CB0 from cb0_head + acoustic, shared denominator)
+first_codebook_weight_multiplier: 1.0   # semantic codebook (CB0) weight
+nonsemantic_audio_weight: 0.02          # acoustic codebooks CB1-7 (native: 0.02)
+text_padding_weight: 0.01               # PAD weight (native PersonaPlex: 0.3)
+text_loss_weight: 0.2                   # text CE multiplier relative to audio (native: 1.0)
+epad_as_padding: false                  # EPAD (word onset) keeps full weight
+user_loss: false                        # supervise user audio streams too
+cb0_source: merge                       # agent CB0 from: qwen (cb0_head) | depformer (step 0) | merge
+
+lora:
+  depformer_mode: full             # dense FP32 depth transformer (trained in the joint stage)
+
+model:
+  root: /home/voice/data/voice/personaplex-7b-v1   # PersonaPlex-7B checkpoint dir (Mimi codec + depformer graft)
+
+data:
+  prepared_dir: /home/voice/data/voice/vdt/data_ready/synthetic_500h
+  window_seconds: 100
+  shuffle: true
+  random_crop: false
+  prompt_aug_prob: 0.0
+  static_chunking: false
+  swap_roles_after_pass: false
+  val_ratio: 0.05
+
+train:
+  output_dir: ../runs/qwen3-06b-audio
+  max_steps: 5000
+  learning_rate: 2.0e-5            # Qwen backbone LoRA
+  depformer_learning_rate: 4.0e-6  # dense depth transformer (PersonaPlex paper start point, not tuned)
+  interface_lr: 5.0e-5
+  audio_embed_lr: 1.0e-4
+  gradient_accumulation_steps: 8
+  warmup_steps: 100
+  eval_every_steps: 500
+  save_every_steps: 1000
+  gradient_checkpointing: true     # dense depformer activations
+  mixed_precision: bf16
+  infer_every_steps: 1000
+  infer_samples: 2
+  final_eval_samples: 5         # after training: score 5 unseen samples into <run>/eval
+
+generation:
+  use_sampling: true
+  temp: 0.8
+  temp_text: 0.7
+  top_k: 250
+  top_k_text: 25
+  audio_silence_frame_cnt: 6
+
+text_prompt_template: auto

@@ -24,6 +24,13 @@ class QwenLMOutput:
     mask: torch.Tensor  # [B, K, T]
     text_logits: torch.Tensor  # [B, 1, T, text_card]
     text_mask: torch.Tensor  # [B, 1, T]
+    # ``cb0_source="merge"`` only: the two agent-CB0 branches before mixing,
+    # for diagnostics (same frame alignment and mask as ``logits[:, 0]``).
+    cb0_head_logits: Optional[torch.Tensor] = None  # [B, 1, T, card]
+    cb0_depth_logits: Optional[torch.Tensor] = None  # [B, 1, T, card]
+
+
+CB0_SOURCES = ("qwen", "depformer", "merge")
 
 
 def _delay_sequence(delays: list[int], tensor: torch.Tensor, padding: torch.Tensor) -> torch.Tensor:
@@ -154,9 +161,12 @@ class QwenMoshiLM(nn.Module):
     consumes the summed embeddings; its hidden state is mapped into the Helium
     context space (``backbone_proj`` + the grafted Helium ``out_norm``) so the
     grafted ``depformer_in`` and depth transformer see the input they were
-    trained on. As in the Cohere TinyAya+Moshi recipe, the agent semantic
-    codebook (CB0) is predicted only by ``cb0_head`` on the Qwen hidden state;
-    the depth transformer refines the remaining codebooks conditioned on it.
+    trained on. ``cb0_source`` selects who predicts the agent semantic codebook
+    (CB0): ``qwen`` uses ``cb0_head`` on the Qwen hidden state (Cohere
+    TinyAya+Moshi recipe), ``depformer`` uses depth step 0 through
+    ``linears[0]`` (native PersonaPlex), ``merge`` adds both with a learned
+    gate on the depth branch that starts at zero. The depth transformer
+    refines the remaining codebooks conditioned on CB0.
     """
 
     def __init__(
@@ -181,6 +191,7 @@ class QwenMoshiLM(nn.Module):
         context_dim: Optional[int] = None,
         audio_emb_init: Optional[list[torch.Tensor]] = None,
         num_hidden_states: Optional[int] = None,
+        cb0_source: str = "qwen",
         device=None,
         dtype: torch.dtype = torch.bfloat16,
     ):
@@ -191,6 +202,9 @@ class QwenMoshiLM(nn.Module):
             raise ValueError(f"delays must contain {n_q + 1} entries, got {len(delays)}")
         if dep_q > n_q:
             raise ValueError(f"dep_q={dep_q} must not exceed n_q={n_q}")
+        if cb0_source not in CB0_SOURCES:
+            raise ValueError(f"cb0_source must be one of {CB0_SOURCES}, got {cb0_source!r}")
+        self.cb0_source = cb0_source
         self.qwen = qwen
         self.card = card
         self.n_q = n_q
@@ -260,6 +274,9 @@ class QwenMoshiLM(nn.Module):
         # did. Zero init: training starts from the unconditioned head.
         self.cb0_text_adapter = nn.Linear(dim, dim, bias=False, **factory_kwargs)
         nn.init.zeros_(self.cb0_text_adapter.weight)
+        # ``merge`` weight of the depth-step-0 CB0 branch. Exists in every mode
+        # so checkpoints share one key set; zero keeps ``merge`` == ``qwen`` at start.
+        self.cb0_depth_gate = nn.Parameter(torch.zeros((), dtype=torch.float32, device=device))
         if depformer_emb is None:
             depformer_emb = nn.ModuleList(
                 [ZeroEmbedding(card + 1, depformer_dim, zero_idx=self.zero_token_id, **factory_kwargs) for _ in range(dep_q - 1)]
@@ -423,13 +440,28 @@ class QwenMoshiLM(nn.Module):
     def forward_codes(self, sequence: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         return self.forward_embeddings(self.embed_codes(sequence))
 
+    def _agent_cb0_logits(self, hidden, text_tokens, depth_step0):
+        """Agent CB0 logits for ``cb0_source``; the one place both paths use.
+
+        Returns ``(logits, head_logits, depth_logits)``; the branch logits are
+        set only in ``merge`` mode (for diagnostics).
+        """
+        if self.cb0_source == "depformer":
+            return self.linears[0](depth_step0), None, None
+        head = self.cb0_logits(hidden, text_tokens)
+        if self.cb0_source == "qwen":
+            return head, None, None
+        depth = self.linears[0](depth_step0).to(head.dtype)
+        return head + self.cb0_depth_gate.to(head.dtype) * depth, head, depth
+
     def forward_depformer_training(
-        self, sequence: torch.Tensor, transformer_out: torch.Tensor, cb0_logits: torch.Tensor
-    ) -> torch.Tensor:
+        self, sequence: torch.Tensor, transformer_out: torch.Tensor, hidden: torch.Tensor
+    ):
         """Run the depth transformer over all codebooks at once (training mode).
 
-        Step 0 still runs (later steps attend to it), but its prediction is
-        ``cb0_logits`` from the backbone head instead of ``linears[0]``.
+        Agent CB0 comes from ``_agent_cb0_logits`` (backbone head, depth step 0
+        or both); depth step 0 always runs because later steps attend to it.
+        Returns ``(logits, cb0_head_logits, cb0_depth_logits)``.
         """
         B, K, T = sequence.shape
         Ka = self.dep_q
@@ -450,6 +482,9 @@ class QwenMoshiLM(nn.Module):
         # depformer_input is [B, T, K, depformer_dim], reshaping to [B * T, K, D]
         depformer_input = depformer_input.view(B * T, Ka, -1)
         depformer_output = self.depformer(depformer_input)
+        cb0_logits, head_logits, depth_logits = self._agent_cb0_logits(
+            hidden, sequence[:, 0], depformer_output[:, 0].view(B, T, -1)
+        )
         all_logits = [cb0_logits]
         for cb_index in range(1, Ka):
             logits = self.linears[cb_index](depformer_output[:, cb_index])
@@ -457,7 +492,7 @@ class QwenMoshiLM(nn.Module):
         logits = torch.stack([step.to(cb0_logits.dtype) for step in all_logits], 1)
         if logits.dim() != 4:  # [B, Ka, T, card]
             raise RuntimeError(f"unexpected depformer logits shape {logits.shape}")
-        return logits
+        return logits, head_logits, depth_logits
 
     def forward_depformer(
         self,
@@ -483,9 +518,9 @@ class QwenMoshiLM(nn.Module):
         # Always run the depformer step: later codebooks attend to its state.
         dep_output = self.depformer(depformer_input)
         if depformer_cb_index == 0:
-            if self._last_cb0_hidden is None:
-                raise RuntimeError("forward_embeddings must run before depformer step 0 (CB0 comes from cb0_head)")
-            logits = self.cb0_logits(self._last_cb0_hidden, sequence[:, 0])
+            if self.cb0_source != "depformer" and self._last_cb0_hidden is None:
+                raise RuntimeError("forward_embeddings must run before depformer step 0 (CB0 uses cb0_head)")
+            logits, _, _ = self._agent_cb0_logits(self._last_cb0_hidden, sequence[:, 0], dep_output)
         else:
             logits = self.linears[depformer_cb_index](dep_output)
         logits = logits[:, None]
@@ -504,8 +539,8 @@ class QwenMoshiLM(nn.Module):
 
         hidden, text_logits = self._backbone(self.embed_codes(delayed_codes[:, :, :-1]))
         targets_in = delayed_codes[:, :, 1:]  # text has no delay: targets_in[:, 0] is the frame's text
-        logits = self.forward_depformer_training(
-            targets_in, self.depth_context(hidden), self.cb0_logits(hidden, targets_in[:, 0])
+        logits, head_logits, depth_logits = self.forward_depformer_training(
+            targets_in, self.depth_context(hidden), hidden
         )
 
         logits, logits_mask = _undelay_sequence(
@@ -514,7 +549,14 @@ class QwenMoshiLM(nn.Module):
         logits_mask &= codes[:, self.audio_offset : self.audio_offset + self.dep_q] != self.zero_token_id
         text_logits, text_logits_mask = _undelay_sequence(self.delays[:1], text_logits, fill_value=float("nan"))
         text_logits_mask &= codes[:, :1] != self.zero_token_id
-        return QwenLMOutput(logits, logits_mask, text_logits, text_logits_mask)
+        branches = {}
+        if head_logits is not None:
+            cb0_delays = self.delays[self.audio_offset : self.audio_offset + 1]
+            branches = {
+                "cb0_head_logits": _undelay_sequence(cb0_delays, head_logits[:, None], fill_value=float("nan"))[0],
+                "cb0_depth_logits": _undelay_sequence(cb0_delays, depth_logits[:, None], fill_value=float("nan"))[0],
+            }
+        return QwenLMOutput(logits, logits_mask, text_logits, text_logits_mask, **branches)
 
     def forward(self, codes: torch.Tensor) -> QwenLMOutput:
         return self.forward_train(codes)

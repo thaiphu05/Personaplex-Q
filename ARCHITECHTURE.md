@@ -134,17 +134,18 @@ Train: tất cả cùng lúc, cosine schedule
           ┌─────────────────────────────┤
           │                             │
    ②      ▼ cb0_head(h_t + cb0_text_adapter(qwen_embed(text_t)))     B1: CB0 nhìn text của frame
-          CB0 agent (nơi DUY NHẤT đoán CB0, train + infer)
+          CB0 agent theo `cb0_source` (mục 4.4): qwen = nhánh này | depformer = linears[0](bước 0) | merge = cả hai
                                         │
    ③                                    ▼ backbone_proj : hidden → 4096 (MỚI, init orthogonal)
                                         ▼ out_norm (LẤY TỪ HELIUM)
                                         │ z_t (4096, cùng dạng với Helium)
                                         ▼ depformer_in[k] : 4096 → 1024 (LẤY TỪ HELIUM, train full)
         ┌────────────────────────────────┐
-        │ Depformer Helium (frozen+LoRA)  │  bước 0: + text_depth_adapter(qwen_embed(text))  (chỉ làm ngữ cảnh)
+        │ Depformer Helium                │  `depformer_mode`: lora (frozen + LoRA) | full (dense FP32)
+        │                                 │  bước 0: + text_depth_adapter(qwen_embed(text))
         │                                 │  bước k: + depformer_emb(CB k-1)
         └───────────────┬────────────────┘
-                        ▼ linears[k], k ≥ 1 (train full; linears[0] không dùng, freeze)
+                        ▼ linears[k], k ≥ 1 (train full); linears[0] chỉ dùng khi cb0_source = depformer | merge
                     CB1..CB7 agent, CB0..CB7 user
 ```
 
@@ -182,6 +183,31 @@ mỗi frame: forward_codes → forward_embeddings
            bước 1..15: depformer sinh CB1.. dựa trên CB0 đó (CB của user lấy từ input thật)
 ```
 
+### 4.4 Nguồn CB0 (`cb0_source`) và chế độ depformer (`lora.depformer_mode`)
+
+Hai tùy chọn độc lập trong config, mặc định giữ hành vi trước đó (`qwen` / `lora`). Chúng được thêm sau khi `tools.audio_probe` cho thấy CB0 là nút thắt audio lớn nhất (`force_text_cb0` rõ hơn hẳn `force_text`), và CB1–7 vẫn méo kể cả khi teacher-forced.
+
+| `cb0_source` | CB0 logits | Train | Freeze |
+|---|---|---|---|
+| `qwen` | `cb0_head(h_t + cb0_text_adapter(text_t))` | `cb0_head`, `cb0_text_adapter` | `linears[0]`, `cb0_depth_gate` |
+| `depformer` | `linears[0](depformer bước 0)`, như PersonaPlex gốc | `linears[0]` | `cb0_head`, `cb0_text_adapter`, gate |
+| `merge` | `cb0_head(...) + g · linears[0](...)`, `g` khởi tạo 0 | cả ba | — |
+
+- Một hàm duy nhất `_agent_cb0_logits` quyết định CB0 cho cả đường train và đường chạy từng bước (bước 0 của `forward_depformer`).
+- `cb0_depth_gate` luôn có trong model và checkpoint. Checkpoint cũ thiếu key này vẫn load được, với `g = 0`, đúng hành vi cũ.
+- Mode `merge` log thêm `diag/cb0_head_only_acc`, `diag/cb0_depth_only_acc`, `diag/cb0_depth_gate`.
+
+`depformer_mode`:
+- `lora`: lõi depformer frozen + LoRA.
+- `full`: lõi depformer dense FP32 (autocast bf16), train ở stage `joint` với `depformer_learning_rate`, frozen ở stage `interface`. Checkpoint chứa toàn bộ `depformer.*`.
+
+**Resume:**
+- Một checkpoint `lora` resume vào run `full` được **gộp LoRA vào dense** (`W + alpha/rank · B@A`), nên tiếp tục từ đúng hàm cũ.
+- Đổi `cb0_source` / `depformer_mode` / stage: chỉ nạp weight, optimizer mới, step đếm lại từ 0.
+- Inference / evaluate kiểm tra `adapter.json`, và báo lỗi nếu config khác mode mà checkpoint đã train.
+
+Config mẫu: `configs/qwen3-0.6b-audio.yaml` (`cb0_source: merge`, `depformer_mode: full`).
+
 ---
 
 ## 5. Loss
@@ -216,13 +242,13 @@ Log:
 | `emb` audio | frozen | nếu `ft_embed` | **train** | nếu `ft_embed` |
 | `stream_gains`, `layer_mix`, `backbone_proj`, `out_norm`, `cb0_head`, `cb0_text_adapter` | n/a | n/a | train | train |
 | `depformer_in`, `depformer_emb`, `linears[1:]`, `text_depth_adapter` | frozen | train | train | train |
-| `linears[0]` (CB0 của depformer) | frozen | train | **freeze, không dùng** | **freeze, không dùng** |
-| Depformer core | LoRA (tùy stage) | LoRA | frozen | LoRA |
+| `linears[0]`, `cb0_head` / `cb0_text_adapter`, `cb0_depth_gate` | — | — | theo `cb0_source` (mục 4.4) | theo `cb0_source` (mục 4.4) |
+| Depformer core | LoRA (tùy stage) | LoRA | frozen | LoRA (`depformer_mode: lora`) hoặc dense FP32 (`full`) |
 
 Learning rate (Qwen):
 - `qwen.*` dùng `learning_rate`.
 - `emb.*` dùng `audio_embed_lr`.
-- `depformer.*` (LoRA) dùng `depformer_learning_rate`, nếu không có thì dùng `interface_lr`.
+- `depformer.*` (LoRA hoặc dense khi `full`) dùng `depformer_learning_rate`, nếu không có thì dùng `interface_lr`.
 - Còn lại dùng `interface_lr`.
 
 Schedule: `train.lr_schedule` là `cosine` (mặc định) hoặc `wsd`.

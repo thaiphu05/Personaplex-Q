@@ -11,7 +11,7 @@ from pathlib import Path
 from .config import Config
 from .data import PreparedSample
 from .lora import inject_lora, load_adapter
-from .peft_adapter import configure_qwen_trainable, inject_depformer_lora, inject_qwen_lora, load_qwen_adapter
+from .peft_adapter import build_qwen_adapters, checkpoint_modes, load_qwen_adapter, read_adapter_meta
 from .runtime import QwenRuntimePaths, RuntimePaths, load_qwen_runtime, load_runtime
 from .text_normalization import encode_system_prompt
 
@@ -66,6 +66,7 @@ def load_inference_runtime(config: Config):
         return load_qwen_runtime(
             QwenRuntimePaths(config.model_root, config.personaplex_source, config.qwen_model_id),
             str(config.device),
+            cb0_source=getattr(config, "cb0_source", "qwen"),
         )
     return load_runtime(RuntimePaths(config.model_root, config.personaplex_source), config.device, config.qlora, config.quant_type)
 
@@ -73,13 +74,20 @@ def load_inference_runtime(config: Config):
 def attach_adapter(config: Config, model, adapter: Path) -> None:
     """Wrap ``model`` with the training-time LoRA surface and load ``adapter``."""
     if config.backbone == "qwen":
+        adapter_file = _adapter_file(adapter)
+        # cb0_source changes the forward without changing the key set, so a
+        # config/checkpoint mismatch would run silently wrong: refuse it.
+        saved = checkpoint_modes(read_adapter_meta(adapter_file))
+        for key, value in saved.items():
+            configured = getattr(config, key, "qwen" if key == "cb0_source" else "lora")
+            if configured != value:
+                raise ValueError(
+                    f"checkpoint {adapter_file} was trained with {key}={value}, config has {key}={configured}; "
+                    "use the training config"
+                )
         # Same LoRA surface as training, or the checkpoint keys will not match.
-        qwen_targets = getattr(config, "qwen_targets", None)
-        targets = tuple(qwen_targets.split(",")) if qwen_targets else None
-        inject_qwen_lora(model, config.lora_qwen_rank, config.lora_qwen_alpha, targets=targets)
-        inject_depformer_lora(model, config.lora_depformer_rank, config.lora_depformer_alpha)
-        configure_qwen_trainable(model, ft_embed=config.ft_embed)
-        load_qwen_adapter(model, _adapter_file(adapter))
+        build_qwen_adapters(model, config)
+        load_qwen_adapter(model, adapter_file)
     else:
         inject_lora(model, config.lora_rank, config.lora_alpha)
         load_adapter(model, adapter)

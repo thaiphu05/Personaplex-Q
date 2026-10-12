@@ -28,12 +28,14 @@ from .objective import (
     torch_weighted_cross_entropy_stats,
 )
 from .peft_adapter import (
-    configure_qwen_trainable,
+    build_qwen_adapters,
+    checkpoint_modes,
     detect_qwen_spec,
-    inject_depformer_lora,
-    inject_qwen_lora,
     load_qwen_adapter,
+    merge_depformer_lora,
     qwen_adapter_state_dict,
+    read_adapter_meta,
+    trainable_summary,
 )
 from .runtime import QwenRuntimePaths, RuntimePaths, load_qwen_runtime, load_runtime
 from .sequence import PersonaPlexTrainingExampleBuilder
@@ -339,7 +341,21 @@ def diagnostic_stats(model_output, example, text_padding_id, torch_module) -> tu
         for k in range(8):
             valid = loss_mask[1 + k] & audio_mask[k]
             add(f"agent_cb{k}", model_output.logits[0, k], labels[1 + k], valid)
+
+        # cb0_source="merge": each branch on its own, to see which one carries CB0.
+        cb0_valid = loss_mask[1] & audio_mask[0]
+        for name in ("cb0_head", "cb0_depth"):
+            branch = getattr(model_output, f"{name}_logits", None)
+            if branch is not None:
+                add(f"{name}_only", branch.reshape(-1, branch.shape[-1]), labels[1], cb0_valid)
         return names, torch_module.stack(rows)
+
+
+def merge_gate_record(model) -> dict[str, float]:
+    """``diag/cb0_depth_gate`` for ``cb0_source="merge"`` models, else nothing."""
+    if getattr(model, "cb0_source", None) != "merge":
+        return {}
+    return {"diag/cb0_depth_gate": float(model.cb0_depth_gate.detach())}
 
 
 def diagnostic_means(names: list[str], stats) -> dict[str, float]:
@@ -434,7 +450,7 @@ def save_adapter(run_dir: Path, model, config: Config, step: int, optimizer=None
     save_file(state, str(adapter))
     (path / "adapter.json").write_text(
         json.dumps(
-            {"step": step, "train_stage": config.train_stage, "model_root": str(config.model_root), "rank": config.lora_rank, "alpha": config.lora_alpha,
+            {"step": step, "train_stage": config.train_stage, "cb0_source": config.cb0_source, "depformer_mode": config.depformer_mode, "model_root": str(config.model_root), "rank": config.lora_rank, "alpha": config.lora_alpha,
              "gradient_accumulation_steps": gradient_accumulation_steps, "num_processes": num_processes},
             indent=2,
         )
@@ -455,7 +471,7 @@ def save_best_adapter(
     save_file(state, str(adapter))
     (path / "adapter.json").write_text(
         json.dumps(
-            {"step": step, "val_loss": val_loss, "train_stage": config.train_stage, "model_root": str(config.model_root), "rank": config.lora_rank, "alpha": config.lora_alpha,
+            {"step": step, "val_loss": val_loss, "train_stage": config.train_stage, "cb0_source": config.cb0_source, "depformer_mode": config.depformer_mode, "model_root": str(config.model_root), "rank": config.lora_rank, "alpha": config.lora_alpha,
              "gradient_accumulation_steps": gradient_accumulation_steps, "num_processes": num_processes},
             indent=2,
         )
@@ -531,16 +547,9 @@ def verify_reloaded_adapter(config: Config, sample, adapter: Path) -> float:
         fresh = load_qwen_runtime(
             QwenRuntimePaths(config.model_root, config.personaplex_source, config.qwen_model_id),
             config.device,
+            cb0_source=config.cb0_source,
         )
-        targets_override = tuple(config.qwen_targets.split(",")) if config.qwen_targets else None
-        inject_qwen_lora(
-            fresh.model,
-            rank=config.lora_qwen_rank,
-            alpha=config.lora_qwen_alpha,
-            targets=targets_override,
-        )
-        inject_depformer_lora(fresh.model, rank=config.lora_depformer_rank, alpha=config.lora_depformer_alpha)
-        configure_qwen_trainable(fresh.model, ft_embed=config.ft_embed, stage=config.train_stage)
+        build_qwen_adapters(fresh.model, config)
         load_qwen_adapter(fresh.model, adapter)
         fresh.model.eval()
         example = build_example(config, sample, fresh)
@@ -714,6 +723,7 @@ def run(
                 runtime = load_qwen_runtime(
                     QwenRuntimePaths(config.model_root, config.personaplex_source, config.qwen_model_id),
                     str(device),
+                    cb0_source=config.cb0_source,
                 )
             else:
                 runtime = load_runtime(
@@ -766,24 +776,30 @@ def run(
         if accelerator.is_main_process:
             print(f"[Overfit] max_samples={config.max_samples}: train={len(train_samples)}, validation off")
 
+    resume_adapter_file = None
+    if resume_from:
+        resume_path = Path(resume_from)
+        resume_adapter_file = resume_path if resume_path.is_file() else resume_path / "lora.safetensors"
+        if not resume_adapter_file.is_file():
+            raise FileNotFoundError(f"resume adapter does not exist: {resume_adapter_file}")
+    resume_meta = read_adapter_meta(resume_adapter_file) if resume_adapter_file else {}
+
     # Inject LoRA with Stage-Wise Freezing support
+    convert_depformer_to_full = False
     if config.backbone == "qwen":
         spec = detect_qwen_spec(runtime.model)
-        targets_override = tuple(config.qwen_targets.split(",")) if config.qwen_targets else None
-        targets = inject_qwen_lora(
-            runtime.model,
-            rank=config.lora_qwen_rank,
-            alpha=config.lora_qwen_alpha,
-            targets=targets_override,
+        saved_modes = checkpoint_modes(resume_meta) if resume_adapter_file else None
+        # A LoRA checkpoint continued as full fine-tuning is rebuilt as LoRA,
+        # loaded, then merged into dense weights (same function, new layout).
+        convert_depformer_to_full = bool(
+            saved_modes and saved_modes["depformer_mode"] == "lora" and config.depformer_mode == "full"
         )
-        targets += inject_depformer_lora(
-            runtime.model, rank=config.lora_depformer_rank, alpha=config.lora_depformer_alpha
-        )
-        configure_qwen_trainable(runtime.model, ft_embed=config.ft_embed, stage=config.train_stage)
+        targets = build_qwen_adapters(runtime.model, config, depformer_mode="lora" if convert_depformer_to_full else None)
         if accelerator.is_main_process:
             print(
-                f"[Qwen Swap] stage={config.train_stage}, family={spec.family} (config: {runtime.qwen_family}), "
-                f"lora targets={spec.lora_targets if targets_override is None else targets_override}, "
+                f"[Qwen Swap] stage={config.train_stage}, cb0_source={config.cb0_source}, "
+                f"depformer_mode={config.depformer_mode}, family={spec.family} (config: {runtime.qwen_family}), "
+                f"lora targets={config.qwen_targets or spec.lora_targets}, "
                 f"rank={config.lora_qwen_rank}, alpha={config.lora_qwen_alpha}"
             )
     else:
@@ -816,35 +832,39 @@ def run(
     # Load LoRA weights before DDP wrapping; optimizer state is restored after wrapping.
     resume_checkpoint_dir = None
     adapter_resume_step = 0
-    if resume_from:
-        resume_path = Path(resume_from)
-        adapter_file = resume_path if resume_path.is_file() else resume_path / "lora.safetensors"
-        if not adapter_file.is_file():
-            raise FileNotFoundError(f"resume adapter does not exist: {adapter_file}")
+    if resume_adapter_file is not None:
+        adapter_file = resume_adapter_file
         resume_checkpoint_dir = adapter_file.parent
         if accelerator.is_main_process:
             print(f"Resuming weights from {adapter_file}")
         if hasattr(runtime.model, "qwen"):
             load_qwen_adapter(runtime.model, adapter_file)
+            if convert_depformer_to_full:
+                merged = merge_depformer_lora(runtime.model, ft_embed=config.ft_embed, stage=config.train_stage)
+                if accelerator.is_main_process:
+                    print(f"[Qwen Swap] merged {merged} depformer LoRA adapters into dense FP32 weights")
         else:
             load_adapter(runtime.model, adapter_file)
-        meta_file = adapter_file.parent / "adapter.json"
-        if meta_file.is_file():
-            try:
-                meta = json.loads(meta_file.read_text(encoding="utf-8"))
-                adapter_resume_step = int(meta.get("step", 0))
-                if accelerator.is_main_process:
-                    print(f"Adapter checkpoint is at optimizer step {adapter_resume_step}")
-            except Exception:
-                meta = {}
+        meta = resume_meta
+        if meta:
+            adapter_resume_step = int(meta.get("step", 0))
+            if accelerator.is_main_process:
+                print(f"Adapter checkpoint is at optimizer step {adapter_resume_step}")
+        if config.backbone == "qwen":
+            # A new stage or CB0/depformer mode trains a different parameter
+            # set: keep the weights, start a fresh optimizer, scheduler and step count.
+            changes = []
             checkpoint_stage = meta.get("train_stage")
-            if config.backbone == "qwen" and checkpoint_stage and checkpoint_stage != config.train_stage:
-                # A new stage trains a different parameter set: keep the
-                # weights, start a fresh optimizer, scheduler and step count.
+            if checkpoint_stage and checkpoint_stage != config.train_stage:
+                changes.append(f"stage {checkpoint_stage} -> {config.train_stage}")
+            for key, value in checkpoint_modes(meta).items():
+                if value != getattr(config, key):
+                    changes.append(f"{key} {value} -> {getattr(config, key)}")
+            if changes:
                 resume_checkpoint_dir = None
                 adapter_resume_step = 0
                 if accelerator.is_main_process:
-                    print(f"Stage change {checkpoint_stage} -> {config.train_stage}: weights only, fresh optimizer from step 0")
+                    print(f"{'; '.join(changes)}: weights only, fresh optimizer from step 0")
 
     # Alias LMModel.forward to forward_train for training execution
     if config.backbone != "qwen":
@@ -854,6 +874,8 @@ def run(
     trainable = [p for p in runtime.model.parameters() if p.requires_grad]
     if accelerator.is_main_process:
         print(f"LoRA targets: {len(targets)}; trainable parameters: {sum(p.numel() for p in trainable):,}")
+        if config.backbone == "qwen":
+            print("Trainable by group: " + ", ".join(f"{group}={count:,}" for group, count in sorted(trainable_summary(runtime.model).items())))
 
     temp_lr = config.learning_rate
     dep_lr = config.depformer_learning_rate
@@ -1025,6 +1047,7 @@ def run(
                     "loss/audio_semantic": float(reduced_sem.detach()),
                     "loss/audio_nonsemantic": float(reduced_nonsem.detach()),
                     **diagnostic_means(diag_names, reduced_diag),
+                    **merge_gate_record(accelerator.unwrap_model(runtime.model)),
                     "lr": optimizer.param_groups[0]["lr"],
                     "grad_norm": grad_norm,
                     "global_batch_size": global_batch_size,

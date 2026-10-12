@@ -12,3 +12,4 @@ qwen_targets: "q_proj,v_proj,k_proj,o_proj"
 ft_embed: true
 qlora: false
 quant_type: nf4
+depformer_mode: lora     # lora: LoRA on the depth transformer | full: dense FP32 fine-tuning (joint stage)

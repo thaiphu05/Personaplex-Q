@@ -208,7 +208,7 @@ def _steal_pp_module(pp_model, name: str):
     return module
 
 
-def load_qwen_runtime(paths: QwenRuntimePaths, device: str = "cuda") -> PersonaPlexRuntime:
+def load_qwen_runtime(paths: QwenRuntimePaths, device: str = "cuda", cb0_source: str = "qwen") -> PersonaPlexRuntime:
     """Build the Qwen-swap runtime from local PersonaPlex assets + a Qwen model.
 
     The PersonaPlex 7B transformer is loaded first only to graft its depth
@@ -310,6 +310,7 @@ def load_qwen_runtime(paths: QwenRuntimePaths, device: str = "cuda") -> PersonaP
         out_norm=out_norm,
         audio_emb_init=helium_audio_emb,
         num_hidden_states=num_hidden_states,
+        cb0_source=cb0_source,
         device=device,
         dtype=lm_dtype,
     )

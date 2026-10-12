@@ -48,6 +48,8 @@ class Config:
     max_samples: int | None = None
     eval_manifest_path: Path | None = None
     final_eval_samples: int = 0
+    cb0_source: str = "qwen"
+    depformer_mode: str = "lora"
     random_crop: bool = False
     prompt_aug_prob: float = 0.0
     static_chunking: bool = False
@@ -142,7 +144,7 @@ def load_config(path: str | Path, overrides: list[str] | None = None) -> Config:
                     hydra_overrides.append(f"train.{o}")
                 elif o.startswith("rank=") or o.startswith("alpha=") or o.startswith("qlora="):
                     hydra_overrides.append(f"lora.{o}")
-                elif o.startswith("qwen_rank=") or o.startswith("qwen_alpha=") or o.startswith("depformer_rank=") or o.startswith("depformer_alpha=") or o.startswith("ft_embed=") or o.startswith("qwen_targets="):
+                elif o.startswith("qwen_rank=") or o.startswith("qwen_alpha=") or o.startswith("depformer_rank=") or o.startswith("depformer_alpha=") or o.startswith("ft_embed=") or o.startswith("qwen_targets=") or o.startswith("depformer_mode="):
                     hydra_overrides.append(f"lora.{o}")
                 elif o.startswith("backbone=") or o.startswith("qwen_id="):
                     hydra_overrides.append(f"model.{o}")
@@ -199,6 +201,12 @@ def load_config(path: str | Path, overrides: list[str] | None = None) -> Config:
     val_manifest_path = resolve(data, "val_manifest") if isinstance(val_manifest_raw, str) and val_manifest_raw else None
     eval_manifest_raw = data.get("eval_manifest")
     eval_manifest_path = resolve(data, "eval_manifest") if isinstance(eval_manifest_raw, str) and eval_manifest_raw else None
+    cb0_source = str(raw.get("cb0_source", "qwen")).lower()
+    if cb0_source not in {"qwen", "depformer", "merge"}:
+        raise ValueError("cb0_source must be qwen, depformer, or merge")
+    depformer_mode = str(lora.get("depformer_mode", "lora")).lower() if isinstance(lora, dict) else "lora"
+    if depformer_mode not in {"lora", "full"}:
+        raise ValueError("lora.depformer_mode must be lora or full")
     final_eval_samples = int(train.get("final_eval_samples", 0)) if isinstance(train, dict) else 0
     if final_eval_samples < 0:
         raise ValueError("train.final_eval_samples must be non-negative")
@@ -282,6 +290,8 @@ def load_config(path: str | Path, overrides: list[str] | None = None) -> Config:
         max_samples=max_samples,
         eval_manifest_path=eval_manifest_path,
         final_eval_samples=final_eval_samples,
+        cb0_source=cb0_source,
+        depformer_mode=depformer_mode,
         random_crop=bool(data.get("random_crop", False)),
         prompt_aug_prob=float(data.get("prompt_aug_prob", 0.0)),
         static_chunking=bool(data.get("static_chunking", False)),

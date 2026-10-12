@@ -35,6 +35,7 @@ INTERFACE_NAMES = (
     "cb0_text_adapter.",
     "stream_gains.",
     "layer_mix.",
+    "cb0_depth_gate",
 )
 QWEN_TRAIN_STAGES = ("interface", "joint")
 
@@ -134,26 +135,38 @@ def _is_lora(name: str) -> bool:
     return ".lora_a." in name or ".lora_b." in name
 
 
-def _is_qwen_adapter_param(name: str) -> bool:
+def _is_qwen_adapter_param(name: str, depformer_full: bool = False) -> bool:
     """Every parameter a Qwen-swap checkpoint owns, trainable or not.
 
     Audio embeddings are always included: they are freshly initialized at load
     time, so a checkpoint without them could not reproduce the trained model.
+    With ``depformer_mode="full"`` the dense depth transformer is owned too.
     """
-    return _is_lora(name) or name.startswith("emb.") or name.startswith(INTERFACE_NAMES)
+    return (
+        _is_lora(name)
+        or name.startswith("emb.")
+        or name.startswith(INTERFACE_NAMES)
+        or (depformer_full and name.startswith("depformer."))
+    )
+
+
+def _depformer_full(model) -> bool:
+    return getattr(model, "depformer_mode", "lora") == "full"
 
 
 def configure_qwen_trainable(model, ft_embed: bool = False, stage: str = "joint") -> None:
-    """Freeze the Qwen core and the depth stack; keep LoRA + interface trainable.
+    """Freeze the Qwen core; keep LoRA, interface and the active CB0 branch trainable.
 
     Trainable groups after this call:
     - interface: ``stream_gains``, ``layer_mix``, ``backbone_proj``, ``out_norm``,
-      ``cb0_head``, ``cb0_text_adapter``, ``depformer_in``,
-      ``linears`` (except ``linears.0``: CB0 comes from ``cb0_head``),
-      ``depformer_emb``, ``text_depth_adapter``
+      ``depformer_in``, ``linears[1:]``, ``depformer_emb``, ``text_depth_adapter``
+    - agent-CB0 branch per ``model.cb0_source``: ``cb0_head`` +
+      ``cb0_text_adapter`` (qwen, merge), ``linears.0`` (depformer, merge),
+      ``cb0_depth_gate`` (merge); unused branches stay frozen
     - audio embeddings ``emb.*`` (always in the ``interface`` stage, otherwise
       when ``ft_embed`` is True)
-    - ``joint`` stage only: Qwen and depth-transformer LoRA adapters
+    - ``joint`` stage only: Qwen LoRA, plus the depth transformer as LoRA
+      adapters (``depformer_mode="lora"``) or as dense weights (``"full"``)
 
     The ``interface`` stage aligns the freshly initialized bridges with the
     frozen backbone and the grafted depth stack before LoRA starts adapting.
@@ -162,6 +175,8 @@ def configure_qwen_trainable(model, ft_embed: bool = False, stage: str = "joint"
         raise ValueError(f"qwen train stage must be one of {QWEN_TRAIN_STAGES}, got {stage!r}")
     train_lora = stage == "joint"
     train_emb = ft_embed or stage == "interface"
+    cb0_source = getattr(model, "cb0_source", "qwen")
+    train_depformer = _depformer_full(model) and stage == "joint"
     for name, parameter in model.named_parameters():
         if _is_lora(name):
             parameter.requires_grad = train_lora
@@ -169,27 +184,128 @@ def configure_qwen_trainable(model, ft_embed: bool = False, stage: str = "joint"
             parameter.requires_grad = False
         elif name.startswith("emb."):
             parameter.requires_grad = train_emb
+        elif name.startswith("depformer."):
+            parameter.requires_grad = train_depformer
+        elif name.startswith(("cb0_head.", "cb0_text_adapter.")):
+            parameter.requires_grad = cb0_source != "depformer"
         elif name.startswith("linears.0."):
-            # CB0 comes from cb0_head; the depformer's CB0 output is never used.
-            parameter.requires_grad = False
+            parameter.requires_grad = cb0_source != "qwen"
+        elif name == "cb0_depth_gate":
+            parameter.requires_grad = cb0_source == "merge"
         elif name.startswith(INTERFACE_NAMES):
             parameter.requires_grad = True
         else:
             parameter.requires_grad = False
 
 
+def build_qwen_adapters(model, config, depformer_mode: str | None = None) -> list[str]:
+    """Wrap a fresh Qwen-swap model with the configured adapters and trainable set.
+
+    The single construction path for training, reload verification, inference
+    and evaluation, so all of them rebuild the same parameter layout.
+    ``depformer_mode`` overrides ``config.depformer_mode`` (checkpoint conversion).
+    """
+    mode = depformer_mode or getattr(config, "depformer_mode", "lora")
+    qwen_targets = getattr(config, "qwen_targets", None)
+    targets = tuple(qwen_targets.split(",")) if qwen_targets else None
+    wrapped = inject_qwen_lora(model, rank=config.lora_qwen_rank, alpha=config.lora_qwen_alpha, targets=targets)
+    if mode == "lora":
+        wrapped += inject_depformer_lora(model, rank=config.lora_depformer_rank, alpha=config.lora_depformer_alpha)
+    elif mode == "full":
+        # FP32 master weights: small Adam steps vanish in bf16; autocast still runs bf16.
+        model.depformer.float()
+    else:
+        raise ValueError(f"depformer_mode must be lora or full, got {mode!r}")
+    model.depformer_mode = mode
+    configure_qwen_trainable(model, ft_embed=config.ft_embed, stage=getattr(config, "train_stage", "joint"))
+    return wrapped
+
+
+def merge_depformer_lora(model, ft_embed: bool = False, stage: str = "joint") -> int:
+    """Fold depth-transformer LoRA into dense FP32 weights and switch to ``full``.
+
+    ``W <- W + (alpha / rank) * B @ A`` per adapter, then the plain Linear
+    replaces its ``LoRALinear`` wrapper, so a LoRA checkpoint continues as
+    full fine-tuning from exactly the same function. Returns the merge count.
+    """
+    adapters = [(name, module) for name, module in model.depformer.named_modules() if isinstance(module, LoRALinear)]
+    for name, module in adapters:
+        parent_name, _, attribute = name.rpartition(".")
+        parent = model.depformer.get_submodule(parent_name) if parent_name else model.depformer
+        base = module.base
+        with torch.no_grad():
+            delta = (module.lora_b.weight.float() @ module.lora_a.weight.float()) * module.scale
+            base.weight.data = base.weight.float() + delta
+        setattr(parent, attribute, base)
+    model.depformer.float()
+    model.depformer_mode = "full"
+    configure_qwen_trainable(model, ft_embed=ft_embed, stage=stage)
+    return len(adapters)
+
+
+def read_adapter_meta(adapter_file) -> dict:
+    """``adapter.json`` saved next to a checkpoint (empty when absent)."""
+    import json
+    from pathlib import Path
+
+    meta_file = Path(adapter_file).parent / "adapter.json"
+    if not meta_file.is_file():
+        return {}
+    try:
+        return json.loads(meta_file.read_text(encoding="utf-8"))
+    except ValueError:
+        return {}
+
+
+def checkpoint_modes(meta: dict) -> dict[str, str]:
+    """CB0 source and depformer mode a checkpoint was trained with.
+
+    Checkpoints saved before these options existed used ``qwen`` / ``lora``.
+    """
+    return {
+        "cb0_source": str(meta.get("cb0_source", "qwen")),
+        "depformer_mode": str(meta.get("depformer_mode", "lora")),
+    }
+
+
+def trainable_summary(model) -> dict[str, int]:
+    """Trainable parameter counts per group, to measure (not guess) run size."""
+    groups: dict[str, int] = {}
+    for name, parameter in model.named_parameters():
+        if not parameter.requires_grad:
+            continue
+        if _is_lora(name):
+            group = "qwen_lora" if name.startswith("qwen.") else "depformer_lora"
+        elif name.startswith("depformer."):
+            group = "depformer_dense"
+        elif name.startswith("emb."):
+            group = "audio_embeddings"
+        else:
+            group = "interface"
+        groups[group] = groups.get(group, 0) + parameter.numel()
+    return groups
+
+
 def qwen_adapter_state_dict(model):
-    """Collect every adapter parameter (LoRA, interface, audio embeddings)."""
-    return {name: parameter.detach().cpu() for name, parameter in model.named_parameters() if _is_qwen_adapter_param(name)}
+    """Collect every adapter parameter (LoRA, interface, audio embeddings, dense depformer if full)."""
+    full = _depformer_full(model)
+    return {
+        name: parameter.detach().cpu()
+        for name, parameter in model.named_parameters()
+        if _is_qwen_adapter_param(name, full)
+    }
 
 
 def load_qwen_adapter(model, path) -> None:
     """Load a Qwen-swap checkpoint, rejecting any key mismatch."""
     from safetensors.torch import load_file
     state = load_file(str(path))
-    expected = {name for name, _ in model.named_parameters() if _is_qwen_adapter_param(name)}
+    full = _depformer_full(model)
+    expected = {name for name, _ in model.named_parameters() if _is_qwen_adapter_param(name, full)}
     supplied = set(state)
-    missing = sorted(expected - supplied)
+    # Checkpoints from before the merge mode lack the CB0 gate; its zero init
+    # reproduces their behavior exactly, so only this key may be absent.
+    missing = sorted(expected - supplied - {"cb0_depth_gate"})
     unexpected = sorted(supplied - {name for name, _ in model.named_parameters()})
     if not expected or missing or unexpected:
         raise RuntimeError(

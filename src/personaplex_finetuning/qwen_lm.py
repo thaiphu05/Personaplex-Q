@@ -1,7 +1,9 @@
 """Qwen backbone wrapper reproducing the PersonaPlex 17-stream training contract.
 
 The Helium temporal transformer is replaced by a frozen Qwen3.5 decoder; Mimi
-and the depth transformer are reused from the PersonaPlex checkpoint. Only the
+and (with ``audio_decoder="depformer"``) the depth transformer are reused from
+the PersonaPlex checkpoint. With ``audio_decoder="heads"`` the agent codebooks
+come from per-codebook heads on the Qwen hidden state instead. Only the
 audio-side interface and small adapters are trained. The module is
 self-contained (torch only) so the delay/undelay helpers do not depend on the
 vendored ``moshi`` package.
@@ -31,6 +33,7 @@ class QwenLMOutput:
 
 
 CB0_SOURCES = ("qwen", "depformer", "merge")
+AUDIO_DECODERS = ("depformer", "heads")
 
 
 def _delay_sequence(delays: list[int], tensor: torch.Tensor, padding: torch.Tensor) -> torch.Tensor:
@@ -137,6 +140,28 @@ class HiddenLayerMix(nn.Module):
         return mixed.to(hidden_states[-1].dtype)
 
 
+class AudioHead(nn.Module):
+    """One agent acoustic codebook predicted straight from the backbone feature.
+
+    RMSNorm, a residual SiLU MLP and a vocabulary projection. The MLP output
+    projection starts at zero, so a fresh head is a linear readout of the
+    normalized feature.
+    """
+
+    def __init__(self, dim: int, card: int, device=None, dtype=None) -> None:
+        super().__init__()
+        factory_kwargs = {"device": device, "dtype": dtype}
+        self.norm = nn.RMSNorm(dim, **factory_kwargs)
+        self.up = nn.Linear(dim, dim, bias=False, **factory_kwargs)
+        self.down = nn.Linear(dim, dim, bias=False, **factory_kwargs)
+        nn.init.zeros_(self.down.weight)
+        self.out = nn.Linear(dim, card, bias=False, **factory_kwargs)
+
+    def forward(self, hidden: torch.Tensor) -> torch.Tensor:
+        x = self.norm(hidden)
+        return self.out(x + self.down(nn.functional.silu(self.up(x))))
+
+
 def _pca_init(table: torch.Tensor, dim: int) -> torch.Tensor:
     """Project a pretrained embedding table onto its top ``dim`` principal axes.
 
@@ -167,6 +192,10 @@ class QwenMoshiLM(nn.Module):
     ``linears[0]`` (native PersonaPlex), ``merge`` adds both with a learned
     gate on the depth branch that starts at zero. The depth transformer
     refines the remaining codebooks conditioned on CB0.
+
+    ``audio_decoder="heads"`` drops the depth stack: ``dep_q`` is the 8 agent
+    codebooks, CB0 still comes from ``cb0_head`` and CB1..7 from
+    ``acoustic_heads`` on the same backbone feature, all in one parallel step.
     """
 
     def __init__(
@@ -192,6 +221,7 @@ class QwenMoshiLM(nn.Module):
         audio_emb_init: Optional[list[torch.Tensor]] = None,
         num_hidden_states: Optional[int] = None,
         cb0_source: str = "qwen",
+        audio_decoder: str = "depformer",
         device=None,
         dtype: torch.dtype = torch.bfloat16,
     ):
@@ -204,7 +234,12 @@ class QwenMoshiLM(nn.Module):
             raise ValueError(f"dep_q={dep_q} must not exceed n_q={n_q}")
         if cb0_source not in CB0_SOURCES:
             raise ValueError(f"cb0_source must be one of {CB0_SOURCES}, got {cb0_source!r}")
+        if audio_decoder not in AUDIO_DECODERS:
+            raise ValueError(f"audio_decoder must be one of {AUDIO_DECODERS}, got {audio_decoder!r}")
+        if audio_decoder == "heads" and cb0_source != "qwen":
+            raise ValueError("audio_decoder='heads' predicts CB0 with cb0_head: cb0_source must be 'qwen'")
         self.cb0_source = cb0_source
+        self.audio_decoder = audio_decoder
         self.qwen = qwen
         self.card = card
         self.n_q = n_q
@@ -252,6 +287,19 @@ class QwenMoshiLM(nn.Module):
             num_hidden_states = int(layers) + 1  # embeddings + every decoder layer
         self.layer_mix = HiddenLayerMix(num_hidden_states).to(device)
 
+        self.cb0_head = nn.Linear(dim, card, bias=False, **factory_kwargs)
+        # Conditions CB0 on the frame's text token, as the native depformer step 0
+        # did. Zero init: training starts from the unconditioned head.
+        self.cb0_text_adapter = nn.Linear(dim, dim, bias=False, **factory_kwargs)
+        nn.init.zeros_(self.cb0_text_adapter.weight)
+
+        if audio_decoder == "heads":
+            if dep_q != n_q // 2:
+                raise ValueError(f"audio_decoder='heads' predicts the {n_q // 2} agent codebooks, got dep_q={dep_q}")
+            self.acoustic_heads = nn.ModuleList([AudioHead(dim, card, **factory_kwargs) for _ in range(dep_q - 1)])
+            self.depformer = None
+            return
+
         if depformer_in is not None:
             context_dim = int(depformer_in[0].in_features)
         elif context_dim is None:
@@ -269,11 +317,6 @@ class QwenMoshiLM(nn.Module):
         if out_norm is None:
             out_norm = nn.RMSNorm(context_dim, **factory_kwargs)
         self.out_norm = out_norm
-        self.cb0_head = nn.Linear(dim, card, bias=False, **factory_kwargs)
-        # Conditions CB0 on the frame's text token, as the native depformer step 0
-        # did. Zero init: training starts from the unconditioned head.
-        self.cb0_text_adapter = nn.Linear(dim, dim, bias=False, **factory_kwargs)
-        nn.init.zeros_(self.cb0_text_adapter.weight)
         # ``merge`` weight of the depth-step-0 CB0 branch. Exists in every mode
         # so checkpoints share one key set; zero keeps ``merge`` == ``qwen`` at start.
         self.cb0_depth_gate = nn.Parameter(torch.zeros((), dtype=torch.float32, device=device))
@@ -421,9 +464,12 @@ class QwenMoshiLM(nn.Module):
 
         LMGen only forwards the depth context to the depformer, so the newest
         frame's feature is kept for ``forward_depformer`` step 0, which also
-        receives that frame's text token.
+        receives that frame's text token. With ``audio_decoder="heads"`` the
+        backbone feature itself is returned for ``forward_audio_heads``.
         """
         hidden, text_logits = self._backbone(input)
+        if self.audio_decoder == "heads":
+            return hidden, text_logits
         self._last_cb0_hidden = hidden[:, -1:]
         return self.depth_context(hidden), text_logits
 
@@ -439,6 +485,24 @@ class QwenMoshiLM(nn.Module):
 
     def forward_codes(self, sequence: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         return self.forward_embeddings(self.embed_codes(sequence))
+
+    def audio_head_logits(self, hidden: torch.Tensor, text_tokens: torch.Tensor) -> torch.Tensor:
+        """Agent CB0..7 logits ``[B, dep_q, T, card]`` for ``audio_decoder="heads"``.
+
+        CB0 sees the frame's text token; CB1..7 are delayed one frame, so the
+        backbone input already carries that frame's CB0.
+        """
+        cb0 = self.cb0_logits(hidden, text_tokens)
+        steps = [cb0] + [head(hidden).to(cb0.dtype) for head in self.acoustic_heads]
+        return torch.stack(steps, 1)
+
+    def forward_audio_heads(self, text_token: torch.Tensor, transformer_out: torch.Tensor) -> torch.Tensor:
+        """One generation step of the heads decoder: ``[B, dep_q, card]`` logits.
+
+        ``text_token`` is the frame's text token ``[B]``; ``transformer_out`` is
+        the backbone feature of that frame ``[B, 1, dim]``.
+        """
+        return self.audio_head_logits(transformer_out, text_token[:, None])[:, :, 0]
 
     def _agent_cb0_logits(self, hidden, text_tokens, depth_step0):
         """Agent CB0 logits for ``cb0_source``; the one place both paths use.
@@ -539,9 +603,12 @@ class QwenMoshiLM(nn.Module):
 
         hidden, text_logits = self._backbone(self.embed_codes(delayed_codes[:, :, :-1]))
         targets_in = delayed_codes[:, :, 1:]  # text has no delay: targets_in[:, 0] is the frame's text
-        logits, head_logits, depth_logits = self.forward_depformer_training(
-            targets_in, self.depth_context(hidden), hidden
-        )
+        if self.audio_decoder == "heads":
+            logits, head_logits, depth_logits = self.audio_head_logits(hidden, targets_in[:, 0]), None, None
+        else:
+            logits, head_logits, depth_logits = self.forward_depformer_training(
+                targets_in, self.depth_context(hidden), hidden
+            )
 
         logits, logits_mask = _undelay_sequence(
             self.delays[self.audio_offset : self.audio_offset + self.dep_q], logits, fill_value=float("nan")

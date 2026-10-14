@@ -208,12 +208,15 @@ def _steal_pp_module(pp_model, name: str):
     return module
 
 
-def load_qwen_runtime(paths: QwenRuntimePaths, device: str = "cuda", cb0_source: str = "qwen") -> PersonaPlexRuntime:
+def load_qwen_runtime(
+    paths: QwenRuntimePaths, device: str = "cuda", cb0_source: str = "qwen", audio_decoder: str = "depformer"
+) -> PersonaPlexRuntime:
     """Build the Qwen-swap runtime from local PersonaPlex assets + a Qwen model.
 
     The PersonaPlex 7B transformer is loaded first only to graft its depth
-    stack, then released before the Qwen decoder is loaded, keeping the peak
-    GPU footprint to roughly one model at a time.
+    stack (``audio_decoder="depformer"``) and its audio embedding tables, then
+    released before the Qwen decoder is loaded, keeping the peak GPU footprint
+    to roughly one model at a time.
     """
     torch = importlib.import_module("torch")
     loaders = importlib.import_module("moshi.models.loaders")
@@ -238,20 +241,20 @@ def load_qwen_runtime(paths: QwenRuntimePaths, device: str = "cuda", cb0_source:
 
     # 1. Graft the depth stack out of the PersonaPlex checkpoint.
     pp_model = loaders.get_moshi_lm(resolved.moshi_weight, device=device, dtype=lm_dtype)
-    depformer = _steal_pp_module(pp_model, "depformer")
-    depformer_in = _steal_pp_module(pp_model, "depformer_in")
-    depformer_emb = _steal_pp_module(pp_model, "depformer_emb")
-    linears = _steal_pp_module(pp_model, "linears")
-    # Helium normalizes its hidden state before depformer_in; keeping that norm
-    # lets the grafted depformer_in see the context distribution it learned.
-    out_norm = _steal_pp_module(pp_model, "out_norm")
+    graft = {}
+    if audio_decoder == "depformer":
+        # Helium normalizes its hidden state before depformer_in; keeping that
+        # norm lets the grafted depformer_in see the context distribution it learned.
+        for name in ("depformer", "depformer_in", "depformer_emb", "linears", "out_norm"):
+            graft[name] = _steal_pp_module(pp_model, name)
     # Helium's audio embedding tables seed the Qwen ones (PCA to the new width).
     helium_audio_emb = [table.weight.detach() for table in _steal_pp_module(pp_model, "emb")]
     schedule = pp_model.depformer_weights_per_step_schedule
     delays = tuple(int(delay) for delay in pp_model.delays)
     card = int(pp_model.card)
-    dep_q = int(pp_model.dep_q)
     n_q = int(pp_model.n_q)
+    # The heads decoder predicts only the agent codebooks.
+    dep_q = n_q // 2 if audio_decoder == "heads" else int(pp_model.dep_q)
     del pp_model
     import gc
     gc.collect()
@@ -302,19 +305,16 @@ def load_qwen_runtime(paths: QwenRuntimePaths, device: str = "cuda", cb0_source:
         text_padding_token_id=text_initial,
         end_of_text_padding_id=end_padding,
         text_initial_token_id=text_initial,
-        depformer=depformer,
-        depformer_in=depformer_in,
-        depformer_emb=depformer_emb,
-        linears=linears,
         depformer_weights_per_step_schedule=schedule,
-        out_norm=out_norm,
         audio_emb_init=helium_audio_emb,
         num_hidden_states=num_hidden_states,
         cb0_source=cb0_source,
+        audio_decoder=audio_decoder,
+        **graft,
         device=device,
         dtype=lm_dtype,
     )
-    del helium_audio_emb
+    del helium_audio_emb, graft
     model.train()
 
     # 4. Mimi codec (frozen) for conversation encoding.

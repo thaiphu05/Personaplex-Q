@@ -310,6 +310,15 @@ Requirements: `transformers>=4.57`, `torch>=2.6`. LoRA surfaces are auto-detecte
 
 > 🇻🇳 *Swap backbone không cần đổi code — chỉ đổi config. Qwen path 3 nhóm LR riêng.*
 
+**Audio decoder (`audio_decoder`).** By default (`depformer`) the agent codebooks come from the depth transformer grafted from PersonaPlex. With `audio_decoder: heads`, Qwen predicts all 8 agent codebooks directly: `cb0_head` predicts CB0 and 7 parallel MLP heads predict CB1–7, with no depth transformer. This requires `cb0_source: qwen` and `user_loss: false`. A depformer checkpoint can warm-start a heads run; the depth-stack keys are dropped and the optimizer restarts. See [ARCHITECHTURE.md §5](ARCHITECHTURE.md).
+
+```bash
+python -m personaplex_finetuning.train --config configs/qwen3-0.6b-heads.yaml \
+  --resume-from runs/<run>/checkpoints/<ckpt>
+```
+
+> 🇻🇳 *`audio_decoder: heads` bỏ Depformer: Qwen đoán thẳng CB0–7 bằng 8 head song song. Warm-start được từ checkpoint depformer.*
+
 ### 4.5 Resume & QLoRA
 
 ```bash
@@ -553,6 +562,7 @@ personaplex-finetune-v2/
 │   ├── demo.yaml             # CLI/Web demo config
 │   ├── qwen3-8b.yaml         # Qwen3-8B backbone swap master
 │   ├── qwen35-9b.yaml        # Qwen3.5-9B backbone swap master
+│   ├── qwen3-0.6b-heads.yaml # Qwen3-0.6B, audio_decoder=heads (no depformer)
 │   ├── model/  data/  lora/  train/   # preset groups
 ├── scripts/                  # launchers & setup
 │   ├── setup_server_env.sh / setup_hf_server_env.sh

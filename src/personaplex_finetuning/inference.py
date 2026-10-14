@@ -11,7 +11,7 @@ from pathlib import Path
 from .config import Config
 from .data import PreparedSample
 from .lora import inject_lora, load_adapter
-from .peft_adapter import build_qwen_adapters, checkpoint_modes, load_qwen_adapter, read_adapter_meta
+from .peft_adapter import CHECKPOINT_MODE_DEFAULTS, build_qwen_adapters, checkpoint_modes, load_qwen_adapter, read_adapter_meta
 from .runtime import QwenRuntimePaths, RuntimePaths, load_qwen_runtime, load_runtime
 from .text_normalization import encode_system_prompt
 
@@ -67,6 +67,7 @@ def load_inference_runtime(config: Config):
             QwenRuntimePaths(config.model_root, config.personaplex_source, config.qwen_model_id),
             str(config.device),
             cb0_source=getattr(config, "cb0_source", "qwen"),
+            audio_decoder=getattr(config, "audio_decoder", "depformer"),
         )
     return load_runtime(RuntimePaths(config.model_root, config.personaplex_source), config.device, config.qlora, config.quant_type)
 
@@ -79,7 +80,7 @@ def attach_adapter(config: Config, model, adapter: Path) -> None:
         # config/checkpoint mismatch would run silently wrong: refuse it.
         saved = checkpoint_modes(read_adapter_meta(adapter_file))
         for key, value in saved.items():
-            configured = getattr(config, key, "qwen" if key == "cb0_source" else "lora")
+            configured = getattr(config, key, CHECKPOINT_MODE_DEFAULTS[key])
             if configured != value:
                 raise ValueError(
                     f"checkpoint {adapter_file} was trained with {key}={value}, config has {key}={configured}; "

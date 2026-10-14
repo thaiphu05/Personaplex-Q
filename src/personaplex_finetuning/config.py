@@ -50,6 +50,7 @@ class Config:
     final_eval_samples: int = 0
     cb0_source: str = "qwen"
     depformer_mode: str = "lora"
+    audio_decoder: str = "depformer"
     random_crop: bool = False
     prompt_aug_prob: float = 0.0
     static_chunking: bool = False
@@ -207,6 +208,11 @@ def load_config(path: str | Path, overrides: list[str] | None = None) -> Config:
     depformer_mode = str(lora.get("depformer_mode", "lora")).lower() if isinstance(lora, dict) else "lora"
     if depformer_mode not in {"lora", "full"}:
         raise ValueError("lora.depformer_mode must be lora or full")
+    audio_decoder = str(raw.get("audio_decoder", "depformer")).lower()
+    if audio_decoder not in {"depformer", "heads"}:
+        raise ValueError("audio_decoder must be depformer or heads")
+    if audio_decoder == "heads" and cb0_source != "qwen":
+        raise ValueError("audio_decoder=heads predicts CB0 with cb0_head: cb0_source must be qwen")
     final_eval_samples = int(train.get("final_eval_samples", 0)) if isinstance(train, dict) else 0
     if final_eval_samples < 0:
         raise ValueError("train.final_eval_samples must be non-negative")
@@ -230,6 +236,8 @@ def load_config(path: str | Path, overrides: list[str] | None = None) -> Config:
     user_loss = raw.get("user_loss", False)
     if not isinstance(user_loss, bool):
         raise ValueError("user_loss must be a boolean")
+    if user_loss and audio_decoder == "heads":
+        raise ValueError("audio_decoder=heads has no user-audio heads: user_loss must be false")
     text_prompt_template = str(raw.get("text_prompt_template", "auto")).lower()
     if text_prompt_template not in {"auto", "native", "qwen"}:
         raise ValueError("text_prompt_template must be auto, native, or qwen")
@@ -292,6 +300,7 @@ def load_config(path: str | Path, overrides: list[str] | None = None) -> Config:
         final_eval_samples=final_eval_samples,
         cb0_source=cb0_source,
         depformer_mode=depformer_mode,
+        audio_decoder=audio_decoder,
         random_crop=bool(data.get("random_crop", False)),
         prompt_aug_prob=float(data.get("prompt_aug_prob", 0.0)),
         static_chunking=bool(data.get("static_chunking", False)),

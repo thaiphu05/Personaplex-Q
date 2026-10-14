@@ -1,0 +1,65 @@
+# Qwen3-0.6B without the depth transformer: Qwen predicts all 8 agent codebooks
+# directly. CB0 keeps cb0_head (+ text adapter); CB1-7 come from 7 parallel MLP heads
+# on the same layer-mixed hidden state. Delays stay [0, 0, 1x7], so CB1-7 of a frame
+# see that frame's CB0 through the input but not each other.
+# Warm-start from an existing qwen3-0.6b checkpoint (depformer keys are dropped, the
+# acoustic heads start fresh, optimizer and step restart):
+#   python -m personaplex_finetuning.train --config configs/qwen3-0.6b-heads.yaml --resume-from runs/<run>/checkpoints/<ckpt>
+defaults:
+  - model: qwen3-0.6b
+  - data: vietnamese
+  - lora: qwen
+  - train: qwen
+  - _self_
+
+seed: 42
+
+# Loss objective: same weights as qwen3-0.6b.yaml so the heads run A/Bs against it.
+# total = text_loss_weight * text + audio (CB0 + CB1-7 heads, shared denominator)
+first_codebook_weight_multiplier: 1.0   # semantic codebook (CB0) weight
+nonsemantic_audio_weight: 0.02          # acoustic codebooks CB1-7; raise if diag/agent_cb1..7 stall
+text_padding_weight: 0.01               # PAD weight (native PersonaPlex: 0.3)
+text_loss_weight: 0.2                   # text CE multiplier relative to audio (native: 1.0)
+epad_as_padding: false                  # EPAD (word onset) keeps full weight
+user_loss: false                        # must stay false: there are no user-audio heads
+cb0_source: qwen                        # required by audio_decoder=heads
+audio_decoder: heads                    # depformer (grafted depth transformer) | heads (8 parallel heads)
+
+model:
+  root: /home/voice/data/voice/personaplex-7b-v1   # PersonaPlex-7B checkpoint dir (Mimi codec + Helium emb for PCA init)
+
+data:
+  prepared_dir: /home/voice/data/voice/vdt/data_ready/synthetic_500h
+  window_seconds: 100
+  shuffle: true
+  random_crop: false
+  prompt_aug_prob: 0.0
+  static_chunking: false
+  swap_roles_after_pass: false
+  val_ratio: 0.05
+
+train:
+  output_dir: ../runs/qwen3-06b-heads
+  max_steps: 5000
+  learning_rate: 2.0e-5            # Qwen backbone LoRA
+  interface_lr: 5.0e-5             # bridges, cb0_head and the new acoustic heads
+  audio_embed_lr: 1.0e-4
+  gradient_accumulation_steps: 8
+  warmup_steps: 100
+  eval_every_steps: 500
+  save_every_steps: 1000
+  gradient_checkpointing: false
+  mixed_precision: bf16
+  infer_every_steps: 1000
+  infer_samples: 2
+  final_eval_samples: 5         # after training: score 5 unseen samples into <run>/eval
+
+generation:
+  use_sampling: true
+  temp: 0.8
+  temp_text: 0.7
+  top_k: 250
+  top_k_text: 25
+  audio_silence_frame_cnt: 6
+
+text_prompt_template: auto

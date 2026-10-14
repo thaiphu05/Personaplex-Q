@@ -1,6 +1,6 @@
-# Kiến trúc PersonaPlex-Q: Helium gốc → Qwen (trước sửa) → Qwen (sau sửa)
+# Kiến trúc PersonaPlex-Q: Helium gốc → Qwen (trước sửa) → Qwen (sau sửa) → Qwen + audio heads
 
-Tài liệu này mô tả 3 phiên bản kiến trúc và chỉ ra chỗ thay đổi giữa chúng. Lý do và kế hoạch chi tiết nằm ở [PLAN.md](PLAN.md).
+Tài liệu này mô tả 4 phiên bản kiến trúc và chỉ ra chỗ thay đổi giữa chúng. Lý do và kế hoạch chi tiết nằm ở [PLAN.md](PLAN.md).
 
 Code liên quan:
 - [qwen_lm.py](src/personaplex_finetuning/qwen_lm.py): wrapper `QwenMoshiLM`
@@ -11,7 +11,7 @@ Code liên quan:
 
 ---
 
-## 1. Phần chung cho cả 3 phiên bản
+## 1. Phần chung cho cả 4 phiên bản
 
 ### 1.1 Mimi codec (frozen, lấy từ PersonaPlex)
 - Audio 24 kHz được nén thành 12.5 frame/giây (80 ms/frame).
@@ -111,7 +111,7 @@ Train: tất cả cùng lúc, cosine schedule
 
 ---
 
-## 4. Phiên bản C: Qwen, sau khi sửa (hiện tại)
+## 4. Phiên bản C: Qwen, sau khi sửa (`audio_decoder: depformer`, mặc định)
 
 ```
                  frame t-1: 17 token
@@ -210,7 +210,66 @@ Config mẫu: `configs/qwen3-0.6b-audio.yaml` (`cb0_source: merge`, `depformer_m
 
 ---
 
-## 5. Loss
+## 5. Phiên bản D: Qwen + 8 audio heads, không Depformer (`audio_decoder: heads`)
+
+```
+                 frame t-1: 17 token
+                        │
+        ┌───────────────▼─────────────────────────────┐
+        │ embed_codes (A1 StreamGains + A2 PCA emb)    │  giống C
+        └───────────────┬─────────────────────────────┘
+        ┌───────────────▼────────────────┐
+        │ Qwen decoder (frozen + LoRA)    │  giống C
+        └───────────────┬────────────────┘
+                        │ hidden_states[0..L]
+          ┌─────────────┴──────────────┐
+          ▼ last_hidden_state           ▼ layer_mix (B2) → h_t
+   qwen.lm_head → text_logits           │
+                ┌───────────────────────┼──────────────────────────┐
+                ▼                       ▼                          ▼
+   cb0_head(h_t + cb0_text_adapter(text_t))   acoustic_heads[1]  …  acoustic_heads[7]
+                │                  (MLP residual cho từng CB, chạy song song)
+                ▼                       ▼                          ▼
+          CB0 agent (frame t)     CB1 … CB7 agent (frame t-1, delay 1)
+```
+
+Mỗi `AudioHead` gồm: `RMSNorm → x + Linear(SiLU(Linear(x))) → Linear(dim, 2048)`. Linear thứ hai của nhánh MLP khởi tạo bằng 0, nên lúc mới tạo, head chỉ là một linear đọc từ `h_t` đã chuẩn hóa.
+
+### 5.1 Thay đổi so với C
+
+| Thay đổi | Code | Vì sao |
+|---|---|---|
+| Bỏ `backbone_proj`, `out_norm`, `depformer_in`, `depformer`, `depformer_emb`, `linears`, `text_depth_adapter`, `cb0_depth_gate` | `QwenMoshiLM.__init__`, `load_qwen_runtime` | Bỏ lớp nối từ Qwen sang không gian Helium, nơi phân bố bị lệch. Không graft khối nào của Helium ngoài bảng `emb` dùng cho PCA init |
+| Thêm `acoustic_heads` (7 × `AudioHead`) cho CB1–7 | `AudioHead`, `audio_head_logits` | Mọi codebook audio nhận gradient trực tiếp từ hidden của Qwen |
+| CB0 giữ nguyên `cb0_head` + `cb0_text_adapter`, `cb0_source` bắt buộc `qwen` | `cb0_logits` | Checkpoint C dùng lại được cho CB0 |
+| `dep_q` 16 → 8 | `load_qwen_runtime` | Chỉ sinh audio agent. Audio user luôn lấy từ input thật |
+| Inference: một bước, sample 8 token cùng lúc | `forward_audio_heads`, `LMGen.depformer_step` (nhánh heads) | Thay 16 bước depth tuần tự |
+
+**Đánh đổi:** CB1–7 của cùng một frame được đoán độc lập với nhau. Chúng chỉ thấy CB0 của frame đó qua input (delay 1), không thấy nhau. Codebook RVQ phụ thuộc nhau mạnh, nên chất âm có thể kém C. Phải A/B nghe thử với C trước khi chọn.
+
+Cohere TinyAya cũng khai báo 8 `audio_heads` dạng `Linear(2048, 2048)` trên layer cuối, nhưng chỉ dùng `audio_heads[0]` cho CB0. `audio_heads[1:8]` không bao giờ vào loss, còn CB1–7 vẫn do depth decoder sinh. Vì vậy chưa có bằng chứng nào cho kiểu "chỉ dùng head" này.
+
+### 5.2 Luồng khi train và inference
+```
+train:     codes → delay → embed_codes → Qwen → h = layer_mix(states)
+           → audio_head_logits(h, text_t) → logits [B, 8, T, 2048] → undelay
+inference: forward_embeddings trả (h_t, text_logits)   ← LMGen coi h_t là "transformer_out"
+           depformer_step (nhánh heads): forward_audio_heads(text vừa lấy mẫu, h_t) → sample 8 token
+```
+Ở bước p, model trả CB0 của frame p và CB1–7 của frame p-1, khớp với delay `[0, 0, 1×7]`.
+
+### 5.3 Checkpoint và warm-start
+- `adapter.json` có thêm `audio_decoder`. Checkpoint cũ không có key này được coi là `depformer`.
+- Resume checkpoint C vào run D (`--resume-from`): bỏ các key chỉ thuộc depformer, nạp các key còn lại (LoRA Qwen, `emb`, `stream_gains`, `layer_mix`, `cb0_head`, `cb0_text_adapter`) và vẫn kiểm tra strict. `acoustic_heads` khởi tạo mới. Optimizer, scheduler và step đếm lại từ 0.
+- Resume D sang C báo lỗi, vì D không có depformer để khôi phục.
+- Inference/evaluate báo lỗi nếu `audio_decoder` trong config khác với checkpoint.
+- `lora.depformer_*` bị bỏ qua ở D.
+
+Config mẫu: `configs/qwen3-0.6b-heads.yaml` (loss weights và LR giống `qwen3-0.6b.yaml` để so sánh công bằng).
+
+---
+
+## 6. Loss
 
 ```
 total = text_loss_weight · CE_text
@@ -231,25 +290,28 @@ Log:
 - `loss/text`, `loss/audio_semantic`, `loss/audio_nonsemantic`.
 - `diag/*` và `val/diag/*`: CE và accuracy không trọng số (text tách từ thật / PAD, từng codebook của agent).
 - `audio_semantic` là khoảng 0.88 × CE thật của CB0, do chia chung mẫu số với acoustic.
+- Phiên bản D: logits chỉ có 8 hàng agent, không có nhóm user, nên `user_loss` phải là `false`. Khi `user_loss=false`, kết quả loss giống hệt C, vì nhóm user ở C vốn có trọng số 0.
 
 ---
 
-## 6. Phần nào được train
+## 7. Phần nào được train
 
-| Nhóm tham số | Helium gốc | Qwen trước sửa | Qwen sau, stage `interface` | Qwen sau, stage `joint` |
-|---|---|---|---|---|
-| Backbone (Helium / Qwen) | LoRA | LoRA q,v | frozen | LoRA q,v |
-| `emb` audio | frozen | nếu `ft_embed` | **train** | nếu `ft_embed` |
-| `stream_gains`, `layer_mix`, `backbone_proj`, `out_norm`, `cb0_head`, `cb0_text_adapter` | n/a | n/a | train | train |
-| `depformer_in`, `depformer_emb`, `linears[1:]`, `text_depth_adapter` | frozen | train | train | train |
-| `linears[0]`, `cb0_head` / `cb0_text_adapter`, `cb0_depth_gate` | — | — | theo `cb0_source` (mục 4.4) | theo `cb0_source` (mục 4.4) |
-| Depformer core | LoRA (tùy stage) | LoRA | frozen | LoRA (`depformer_mode: lora`) hoặc dense FP32 (`full`) |
+| Nhóm tham số | Helium gốc | Qwen trước sửa | Qwen sau (C), stage `interface` | Qwen sau (C), stage `joint` | Qwen + heads (D), `interface` / `joint` |
+|---|---|---|---|---|---|
+| Backbone (Helium / Qwen) | LoRA | LoRA q,v | frozen | LoRA q,v | frozen / LoRA q,v |
+| `emb` audio | frozen | nếu `ft_embed` | **train** | nếu `ft_embed` | **train** / nếu `ft_embed` |
+| `stream_gains`, `layer_mix`, `cb0_head`, `cb0_text_adapter` | n/a | n/a | train | train | train |
+| `backbone_proj`, `out_norm` | n/a | n/a | train | train | — |
+| `depformer_in`, `depformer_emb`, `linears[1:]`, `text_depth_adapter` | frozen | train | train | train | — |
+| `linears[0]`, `cb0_head` / `cb0_text_adapter`, `cb0_depth_gate` | — | — | theo `cb0_source` (mục 4.4) | theo `cb0_source` (mục 4.4) | chỉ `cb0_head` / `cb0_text_adapter` |
+| `acoustic_heads` | — | — | — | — | train |
+| Depformer core | LoRA (tùy stage) | LoRA | frozen | LoRA (`depformer_mode: lora`) hoặc dense FP32 (`full`) | — |
 
 Learning rate (Qwen):
 - `qwen.*` dùng `learning_rate`.
 - `emb.*` dùng `audio_embed_lr`.
 - `depformer.*` (LoRA hoặc dense khi `full`) dùng `depformer_learning_rate`, nếu không có thì dùng `interface_lr`.
-- Còn lại dùng `interface_lr`.
+- Còn lại (kể cả `acoustic_heads` ở D) dùng `interface_lr`.
 
 Schedule: `train.lr_schedule` là `cosine` (mặc định) hoặc `wsd`.
 
@@ -260,22 +322,24 @@ Schedule: `train.lr_schedule` là `cosine` (mặc định) hoặc `wsd`.
 
 ---
 
-## 7. So sánh với Cohere (TinyAya + Moshi)
+## 8. So sánh với Cohere (TinyAya + Moshi)
 
-| | Cohere | Qwen sau sửa (C) |
-|---|---|---|
-| Audio embedding | Chung bảng với backbone | Bảng riêng, scale theo text |
-| Ai đoán CB0 | Backbone (audio head), cả khi inference | Backbone (`cb0_head`), cả khi train và inference |
-| Nối sang depth decoder | Projection 2048→4096, I/O train full | Projection →4096 + `out_norm` Helium, I/O train full |
-| Depth decoder | Frozen, chỉ sinh CB1–7 | Frozen + LoRA, sinh 16 CB |
-| LoRA backbone | q, v, embed, r=64 | q, v, r=64 |
-| Text / padding weight | 0.1–0.2 / 0.01 | 0.2 / 0.01 |
+| | Cohere | Qwen sau sửa (C) | Qwen + heads (D) |
+|---|---|---|---|
+| Audio embedding | Chung bảng với backbone | Bảng riêng, scale theo text | Như C |
+| Ai đoán CB0 | Backbone (`audio_heads[0]` = `Linear(2048, 2048)` trên layer cuối), cả khi inference | Backbone (`cb0_head` trên `layer_mix`, nhìn text của frame), cả khi train và inference | Như C |
+| Nối sang depth decoder | Projection 2048→4096, I/O train full | Projection →4096 + `out_norm` Helium, I/O train full | Không có |
+| Depth decoder | Frozen, chỉ sinh CB1–7 | Frozen + LoRA, sinh 16 CB | Không có; 7 head MLP song song cho CB1–7 |
+| Delay | CB_k trễ k frame | `[0, 0, 1×7]` | `[0, 0, 1×7]` |
+| LoRA backbone | q, v, embed, r=64 | q, v, r=64 | q, v, r=64 |
+| Text / padding weight | 0.1–0.2 / 0.01 | 0.2 / 0.01 | 0.2 / 0.01 |
 
 ---
 
-## 8. Chưa làm / rủi ro
+## 9. Chưa làm / rủi ro
 
 - **PAD/EPAD trùng nhau** ở Qwen2.5-3B base (`<|endoftext|>`). Qwen3 dùng `<|im_end|>` làm EPAD. Phần này thuộc phase 1, chưa sửa.
 - **Phase 0:** script baseline (unigram/bigram CB0, ablation thay output Qwen bằng 0) chưa làm.
 - **Chưa chạy trên GPU** với checkpoint thật. Nên chạy `--smoke` trước.
 - Qwen không có pretrain audio. Kỳ vọng thực tế: phía text tốt, âm thanh kém tự nhiên hơn PersonaPlex gốc.
+- **Phiên bản D chưa chạy trên GPU.** Chưa biết các head song song cho CB1–7 có thắng depformer hay không. `nonsemantic_audio_weight=0.02` có thể quá thấp cho head mới học từ đầu: theo dõi `diag/agent_cb1..7` trước khi tăng.

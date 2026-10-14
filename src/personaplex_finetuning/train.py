@@ -269,11 +269,14 @@ def loss_components(
     )
     text_loss = text_stats[0] / text_stats[1].clamp_min(1e-12)
 
-    audio_target = labels_tensor[1:17]
+    # The heads decoder predicts only the 8 agent codebooks, so the user groups
+    # exist only with 16 logit rows (user_loss=false gives them zero weight anyway).
+    num_audio = model_output.logits.shape[1]
+    audio_target = labels_tensor[1 : 1 + num_audio]
     model_mask = model_output.mask
     if model_mask.ndim == 3:
         model_mask = model_mask[0]
-    audio_weights = weights[1:17] * model_mask.to(weights.dtype)
+    audio_weights = weights[1 : 1 + num_audio] * model_mask.to(weights.dtype)
 
     def audio_group(start: int, end: int):
         return torch_weighted_cross_entropy_stats(
@@ -282,22 +285,21 @@ def loss_components(
             audio_weights[start:end].reshape(-1),
         )
 
-    agent_semantic = audio_group(0, 1)
-    agent_acoustic = audio_group(1, 8)
-    user_semantic = audio_group(8, 9)
-    user_acoustic = audio_group(9, 16)
-    audio_denominator = sum(
-        stats[1] for stats in (agent_semantic, agent_acoustic, user_semantic, user_acoustic)
-    ).clamp_min(1e-12)
+    semantic = [audio_group(0, 1)]  # agent CB0
+    acoustic = [audio_group(1, 8)]  # agent CB1-7
+    if num_audio == 16:
+        semantic.append(audio_group(8, 9))
+        acoustic.append(audio_group(9, 16))
+    audio_denominator = sum(stats[1] for stats in semantic + acoustic).clamp_min(1e-12)
+    semantic_sum = sum(stats[0] for stats in semantic)
+    acoustic_sum = sum(stats[0] for stats in acoustic)
 
     components = {
         "text": text_loss,
-        "audio_semantic": (agent_semantic[0] + user_semantic[0]) / audio_denominator,
-        "audio_nonsemantic": (agent_acoustic[0] + user_acoustic[0]) / audio_denominator,
+        "audio_semantic": semantic_sum / audio_denominator,
+        "audio_nonsemantic": acoustic_sum / audio_denominator,
     }
-    total = text_loss_weight * text_loss + (
-        agent_semantic[0] + agent_acoustic[0] + user_semantic[0] + user_acoustic[0]
-    ) / audio_denominator
+    total = text_loss_weight * text_loss + (semantic_sum + acoustic_sum) / audio_denominator
     return total, components
 
 
@@ -450,7 +452,7 @@ def save_adapter(run_dir: Path, model, config: Config, step: int, optimizer=None
     save_file(state, str(adapter))
     (path / "adapter.json").write_text(
         json.dumps(
-            {"step": step, "train_stage": config.train_stage, "cb0_source": config.cb0_source, "depformer_mode": config.depformer_mode, "model_root": str(config.model_root), "rank": config.lora_rank, "alpha": config.lora_alpha,
+            {"step": step, "train_stage": config.train_stage, "cb0_source": config.cb0_source, "depformer_mode": config.depformer_mode, "audio_decoder": config.audio_decoder, "model_root": str(config.model_root), "rank": config.lora_rank, "alpha": config.lora_alpha,
              "gradient_accumulation_steps": gradient_accumulation_steps, "num_processes": num_processes},
             indent=2,
         )
@@ -471,7 +473,7 @@ def save_best_adapter(
     save_file(state, str(adapter))
     (path / "adapter.json").write_text(
         json.dumps(
-            {"step": step, "val_loss": val_loss, "train_stage": config.train_stage, "cb0_source": config.cb0_source, "depformer_mode": config.depformer_mode, "model_root": str(config.model_root), "rank": config.lora_rank, "alpha": config.lora_alpha,
+            {"step": step, "val_loss": val_loss, "train_stage": config.train_stage, "cb0_source": config.cb0_source, "depformer_mode": config.depformer_mode, "audio_decoder": config.audio_decoder, "model_root": str(config.model_root), "rank": config.lora_rank, "alpha": config.lora_alpha,
              "gradient_accumulation_steps": gradient_accumulation_steps, "num_processes": num_processes},
             indent=2,
         )
@@ -548,6 +550,7 @@ def verify_reloaded_adapter(config: Config, sample, adapter: Path) -> float:
             QwenRuntimePaths(config.model_root, config.personaplex_source, config.qwen_model_id),
             config.device,
             cb0_source=config.cb0_source,
+            audio_decoder=config.audio_decoder,
         )
         build_qwen_adapters(fresh.model, config)
         load_qwen_adapter(fresh.model, adapter)
@@ -724,6 +727,7 @@ def run(
                     QwenRuntimePaths(config.model_root, config.personaplex_source, config.qwen_model_id),
                     str(device),
                     cb0_source=config.cb0_source,
+                    audio_decoder=config.audio_decoder,
                 )
             else:
                 runtime = load_runtime(
@@ -786,19 +790,32 @@ def run(
 
     # Inject LoRA with Stage-Wise Freezing support
     convert_depformer_to_full = False
+    warm_start_heads = False
     if config.backbone == "qwen":
         spec = detect_qwen_spec(runtime.model)
         saved_modes = checkpoint_modes(resume_meta) if resume_adapter_file else None
         # A LoRA checkpoint continued as full fine-tuning is rebuilt as LoRA,
         # loaded, then merged into dense weights (same function, new layout).
         convert_depformer_to_full = bool(
-            saved_modes and saved_modes["depformer_mode"] == "lora" and config.depformer_mode == "full"
+            saved_modes
+            and config.audio_decoder == "depformer"
+            and saved_modes["depformer_mode"] == "lora"
+            and config.depformer_mode == "full"
         )
+        # A depformer checkpoint seeds the heads decoder with everything but the
+        # depth stack; the reverse has no depth stack to restore.
+        if saved_modes and saved_modes["audio_decoder"] != config.audio_decoder:
+            if config.audio_decoder != "heads":
+                raise ValueError(
+                    f"cannot resume an audio_decoder={saved_modes['audio_decoder']} checkpoint "
+                    f"as audio_decoder={config.audio_decoder}"
+                )
+            warm_start_heads = True
         targets = build_qwen_adapters(runtime.model, config, depformer_mode="lora" if convert_depformer_to_full else None)
         if accelerator.is_main_process:
             print(
                 f"[Qwen Swap] stage={config.train_stage}, cb0_source={config.cb0_source}, "
-                f"depformer_mode={config.depformer_mode}, family={spec.family} (config: {runtime.qwen_family}), "
+                f"audio_decoder={config.audio_decoder}, depformer_mode={runtime.model.depformer_mode}, family={spec.family} (config: {runtime.qwen_family}), "
                 f"lora targets={config.qwen_targets or spec.lora_targets}, "
                 f"rank={config.lora_qwen_rank}, alpha={config.lora_qwen_alpha}"
             )
@@ -838,7 +855,9 @@ def run(
         if accelerator.is_main_process:
             print(f"Resuming weights from {adapter_file}")
         if hasattr(runtime.model, "qwen"):
-            load_qwen_adapter(runtime.model, adapter_file)
+            load_qwen_adapter(runtime.model, adapter_file, warm_start_heads=warm_start_heads)
+            if warm_start_heads and accelerator.is_main_process:
+                print("[Qwen Swap] warm-started the heads decoder: depformer keys dropped, acoustic_heads fresh")
             if convert_depformer_to_full:
                 merged = merge_depformer_lora(runtime.model, ft_embed=config.ft_embed, stage=config.train_stage)
                 if accelerator.is_main_process:

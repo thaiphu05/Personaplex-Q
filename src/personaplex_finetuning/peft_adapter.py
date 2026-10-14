@@ -36,6 +36,19 @@ INTERFACE_NAMES = (
     "stream_gains.",
     "layer_mix.",
     "cb0_depth_gate",
+    "acoustic_heads.",
+)
+# Interface owned only by the depformer decoder; a depformer checkpoint warm-starting
+# an ``audio_decoder="heads"`` model drops these keys.
+DEPFORMER_DECODER_NAMES = (
+    "depformer.",
+    "depformer_in.",
+    "depformer_emb.",
+    "linears.",
+    "text_depth_adapter.",
+    "backbone_proj.",
+    "out_norm.",
+    "cb0_depth_gate",
 )
 QWEN_TRAIN_STAGES = ("interface", "joint")
 
@@ -160,6 +173,7 @@ def configure_qwen_trainable(model, ft_embed: bool = False, stage: str = "joint"
     Trainable groups after this call:
     - interface: ``stream_gains``, ``layer_mix``, ``backbone_proj``, ``out_norm``,
       ``depformer_in``, ``linears[1:]``, ``depformer_emb``, ``text_depth_adapter``
+      (``audio_decoder="depformer"``) or ``acoustic_heads`` (``"heads"``)
     - agent-CB0 branch per ``model.cb0_source``: ``cb0_head`` +
       ``cb0_text_adapter`` (qwen, merge), ``linears.0`` (depformer, merge),
       ``cb0_depth_gate`` (merge); unused branches stay frozen
@@ -209,7 +223,9 @@ def build_qwen_adapters(model, config, depformer_mode: str | None = None) -> lis
     qwen_targets = getattr(config, "qwen_targets", None)
     targets = tuple(qwen_targets.split(",")) if qwen_targets else None
     wrapped = inject_qwen_lora(model, rank=config.lora_qwen_rank, alpha=config.lora_qwen_alpha, targets=targets)
-    if mode == "lora":
+    if getattr(model, "audio_decoder", "depformer") == "heads":
+        mode = "none"  # no depth transformer to adapt
+    elif mode == "lora":
         wrapped += inject_depformer_lora(model, rank=config.lora_depformer_rank, alpha=config.lora_depformer_alpha)
     elif mode == "full":
         # FP32 master weights: small Adam steps vanish in bf16; autocast still runs bf16.
@@ -257,15 +273,13 @@ def read_adapter_meta(adapter_file) -> dict:
         return {}
 
 
-def checkpoint_modes(meta: dict) -> dict[str, str]:
-    """CB0 source and depformer mode a checkpoint was trained with.
+# Values of the mode keys for checkpoints saved before each option existed.
+CHECKPOINT_MODE_DEFAULTS = {"cb0_source": "qwen", "depformer_mode": "lora", "audio_decoder": "depformer"}
 
-    Checkpoints saved before these options existed used ``qwen`` / ``lora``.
-    """
-    return {
-        "cb0_source": str(meta.get("cb0_source", "qwen")),
-        "depformer_mode": str(meta.get("depformer_mode", "lora")),
-    }
+
+def checkpoint_modes(meta: dict) -> dict[str, str]:
+    """CB0 source, depformer mode and audio decoder a checkpoint was trained with."""
+    return {key: str(meta.get(key, default)) for key, default in CHECKPOINT_MODE_DEFAULTS.items()}
 
 
 def trainable_summary(model) -> dict[str, int]:
@@ -280,6 +294,8 @@ def trainable_summary(model) -> dict[str, int]:
             group = "depformer_dense"
         elif name.startswith("emb."):
             group = "audio_embeddings"
+        elif name.startswith("acoustic_heads."):
+            group = "audio_heads"
         else:
             group = "interface"
         groups[group] = groups.get(group, 0) + parameter.numel()
@@ -296,16 +312,25 @@ def qwen_adapter_state_dict(model):
     }
 
 
-def load_qwen_adapter(model, path) -> None:
-    """Load a Qwen-swap checkpoint, rejecting any key mismatch."""
+def load_qwen_adapter(model, path, warm_start_heads: bool = False) -> None:
+    """Load a Qwen-swap checkpoint, rejecting any key mismatch.
+
+    ``warm_start_heads`` loads a depformer-decoder checkpoint into an
+    ``audio_decoder="heads"`` model: the depformer-only keys are dropped and
+    the new ``acoustic_heads`` keep their fresh init. Every other key must match.
+    """
     from safetensors.torch import load_file
     state = load_file(str(path))
+    allowed_missing = {"cb0_depth_gate"}
+    if warm_start_heads:
+        state = {name: value for name, value in state.items() if not name.startswith(DEPFORMER_DECODER_NAMES)}
+        allowed_missing |= {name for name, _ in model.named_parameters() if name.startswith("acoustic_heads.")}
     full = _depformer_full(model)
     expected = {name for name, _ in model.named_parameters() if _is_qwen_adapter_param(name, full)}
     supplied = set(state)
     # Checkpoints from before the merge mode lack the CB0 gate; its zero init
     # reproduces their behavior exactly, so only this key may be absent.
-    missing = sorted(expected - supplied - {"cb0_depth_gate"})
+    missing = sorted(expected - supplied - allowed_missing)
     unexpected = sorted(supplied - {name for name, _ in model.named_parameters()})
     if not expected or missing or unexpected:
         raise RuntimeError(

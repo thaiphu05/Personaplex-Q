@@ -1136,6 +1136,15 @@ class LMGen(StreamingModule[_LMGenState]):
         (B,) = text_token.shape
         prev_token = text_token
         lm_model = self.lm_model
+        if getattr(lm_model, "audio_decoder", "depformer") == "heads":
+            # Parallel per-codebook heads: no depth chain, so the provided
+            # tokens never feed a later codebook and all are sampled at once.
+            logits = lm_model.forward_audio_heads(text_token, transformer_out)  # [B, dep_q, card]
+            tokens = sample_token(logits.float(), self.use_sampling, self.temp, self.top_k)
+            assert tokens.shape == (B, lm_model.dep_q), tokens.shape
+            if self.return_logits:
+                return tokens, logits.float()
+            return tokens
         depformer_tokens: list[torch.Tensor] = []
         depformer_logits: list[torch.Tensor] = []
         assert not lm_model.depformer.is_streaming

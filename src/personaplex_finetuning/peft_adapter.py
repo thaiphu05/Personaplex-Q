@@ -33,6 +33,7 @@ INTERFACE_NAMES = (
     "out_norm.",
     "cb0_head.",
     "cb0_text_adapter.",
+    "cb0_mlp.",
     "stream_gains.",
     "layer_mix.",
     "cb0_depth_gate",
@@ -175,7 +176,7 @@ def configure_qwen_trainable(model, ft_embed: bool = False, stage: str = "joint"
       ``depformer_in``, ``linears[1:]``, ``depformer_emb``, ``text_depth_adapter``
       (``audio_decoder="depformer"``) or ``acoustic_heads`` (``"heads"``)
     - agent-CB0 branch per ``model.cb0_source``: ``cb0_head`` +
-      ``cb0_text_adapter`` (qwen, merge), ``linears.0`` (depformer, merge),
+      ``cb0_text_adapter`` + ``cb0_mlp`` (qwen, merge), ``linears.0`` (depformer, merge),
       ``cb0_depth_gate`` (merge); unused branches stay frozen
     - audio embeddings ``emb.*`` (always in the ``interface`` stage, otherwise
       when ``ft_embed`` is True)
@@ -200,7 +201,7 @@ def configure_qwen_trainable(model, ft_embed: bool = False, stage: str = "joint"
             parameter.requires_grad = train_emb
         elif name.startswith("depformer."):
             parameter.requires_grad = train_depformer
-        elif name.startswith(("cb0_head.", "cb0_text_adapter.")):
+        elif name.startswith(("cb0_head.", "cb0_text_adapter.", "cb0_mlp.")):
             parameter.requires_grad = cb0_source != "depformer"
         elif name.startswith("linears.0."):
             parameter.requires_grad = cb0_source != "qwen"
@@ -312,24 +313,27 @@ def qwen_adapter_state_dict(model):
     }
 
 
-def load_qwen_adapter(model, path, warm_start_heads: bool = False) -> None:
+def load_qwen_adapter(model, path, warm_start_heads: bool = False) -> list[str]:
     """Load a Qwen-swap checkpoint, rejecting any key mismatch.
 
     ``warm_start_heads`` loads a depformer-decoder checkpoint into an
     ``audio_decoder="heads"`` model: the depformer-only keys are dropped and
     the new ``acoustic_heads`` keep their fresh init. Every other key must match.
+
+    Returns the parameters the checkpoint did not supply (kept at their init),
+    so a caller restoring optimizer state knows the parameter set grew.
     """
     from safetensors.torch import load_file
     state = load_file(str(path))
-    allowed_missing = {"cb0_depth_gate"}
+    # Added after checkpoints already existed; their identity/zero init
+    # reproduces those checkpoints exactly, so they may be absent.
+    allowed_missing = {"cb0_depth_gate"} | {name for name, _ in model.named_parameters() if name.startswith("cb0_mlp.")}
     if warm_start_heads:
         state = {name: value for name, value in state.items() if not name.startswith(DEPFORMER_DECODER_NAMES)}
         allowed_missing |= {name for name, _ in model.named_parameters() if name.startswith("acoustic_heads.")}
     full = _depformer_full(model)
     expected = {name for name, _ in model.named_parameters() if _is_qwen_adapter_param(name, full)}
     supplied = set(state)
-    # Checkpoints from before the merge mode lack the CB0 gate; its zero init
-    # reproduces their behavior exactly, so only this key may be absent.
     missing = sorted(expected - supplied - allowed_missing)
     unexpected = sorted(supplied - {name for name, _ in model.named_parameters()})
     if not expected or missing or unexpected:
@@ -337,3 +341,4 @@ def load_qwen_adapter(model, path, warm_start_heads: bool = False) -> None:
             f"qwen adapter mismatch; missing={missing[:5]}, unexpected={unexpected[:5]}"
         )
     model.load_state_dict(state, strict=False)
+    return sorted(expected - supplied)

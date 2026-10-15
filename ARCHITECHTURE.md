@@ -133,7 +133,7 @@ Train: tất cả cùng lúc, cosine schedule
                                         │
           ┌─────────────────────────────┤
           │                             │
-   ②      ▼ cb0_head(h_t + cb0_text_adapter(qwen_embed(text_t)))     B1: CB0 nhìn text của frame
+   ②      ▼ cb0_head(cb0_mlp(h_t + cb0_text_adapter(qwen_embed(text_t))))   B1: CB0 nhìn text của frame
           CB0 agent theo `cb0_source` (mục 4.4): qwen = nhánh này | depformer = linears[0](bước 0) | merge = cả hai
                                         │
    ③                                    ▼ backbone_proj : hidden → 4096 (MỚI, init orthogonal)
@@ -158,6 +158,7 @@ Train: tất cả cùng lúc, cosine schedule
 | B2 | `HiddenLayerMix`: trộn có trọng số mọi hidden state (các layer giữa đi qua norm cuối của Qwen trước khi trộn), khởi tạo trung bình đều. Text vẫn lấy từ layer cuối | `HiddenLayerMix`, `_backbone` | Layer cuối của LM chuyên đoán text; các layer giữa giữ nhiều chi tiết âm thanh và vị trí hơn |
 | ② | `cb0_head` là nơi duy nhất đoán CB0 | `cb0_logits`, `forward_depformer_training`, `forward_depformer` | Qwen nhận gradient CB0 trực tiếp và tự quyết định "nói gì" (giống Cohere). Depformer chỉ lo âm sắc |
 | ② B1 | `cb0_text_adapter` (khởi tạo bằng 0): CB0 nhìn text token của cùng frame | `cb0_logits` | Text và CB0 không còn được lấy mẫu độc lập. Khôi phục điều kiện "CB0 phụ thuộc text" của thiết kế gốc |
+| ② B3 | `cb0_mlp`: `ResidualMLP` = `x + Linear(SiLU(Linear(RMSNorm(x))))` trước `cb0_head`, Linear cuối khởi tạo bằng 0 | `ResidualMLP`, `cb0_logits` | Khi chỉ có một Linear, CB0 chững ở khoảng 50% accuracy và loss ngừng giảm sớm. Lúc mới tạo, khối này là identity, nên checkpoint cũ (không có `cb0_mlp`) vẫn nạp được và giữ nguyên hàm; khi resume, optimizer khởi tạo lại |
 | ③ | `backbone_proj` + `out_norm` của Helium + `depformer_in` của Helium | `depth_context()`, `load_qwen_runtime` | Depformer nhận lại context đúng dạng nó đã được train. Chỉ projection phải học |
 
 Ghi chú:
@@ -189,7 +190,7 @@ Hai tùy chọn độc lập trong config, mặc định giữ hành vi trước
 
 | `cb0_source` | CB0 logits | Train | Freeze |
 |---|---|---|---|
-| `qwen` | `cb0_head(h_t + cb0_text_adapter(text_t))` | `cb0_head`, `cb0_text_adapter` | `linears[0]`, `cb0_depth_gate` |
+| `qwen` | `cb0_head(cb0_mlp(h_t + cb0_text_adapter(text_t)))` | `cb0_head`, `cb0_text_adapter`, `cb0_mlp` | `linears[0]`, `cb0_depth_gate` |
 | `depformer` | `linears[0](depformer bước 0)`, như PersonaPlex gốc | `linears[0]` | `cb0_head`, `cb0_text_adapter`, gate |
 | `merge` | `cb0_head(...) + g · linears[0](...)`, `g` khởi tạo 0 | cả ba | — |
 
@@ -227,13 +228,13 @@ Config mẫu: `configs/qwen3-0.6b-audio.yaml` (`cb0_source: merge`, `depformer_m
    qwen.lm_head → text_logits           │
                 ┌───────────────────────┼──────────────────────────┐
                 ▼                       ▼                          ▼
-   cb0_head(h_t + cb0_text_adapter(text_t))   acoustic_heads[1]  …  acoustic_heads[7]
+   cb0_head(cb0_mlp(h_t + cb0_text_adapter(text_t)))   acoustic_heads[1]  …  acoustic_heads[7]
                 │                  (MLP residual cho từng CB, chạy song song)
                 ▼                       ▼                          ▼
           CB0 agent (frame t)     CB1 … CB7 agent (frame t-1, delay 1)
 ```
 
-Mỗi `AudioHead` gồm: `RMSNorm → x + Linear(SiLU(Linear(x))) → Linear(dim, 2048)`. Linear thứ hai của nhánh MLP khởi tạo bằng 0, nên lúc mới tạo, head chỉ là một linear đọc từ `h_t` đã chuẩn hóa.
+Mỗi `AudioHead` là `Linear(dim, 2048)` đặt sau một `ResidualMLP`, cùng kiểu khối với `cb0_mlp`: `x + Linear(SiLU(Linear(RMSNorm(x))))`, Linear cuối của MLP khởi tạo bằng 0. Lúc mới tạo, head chỉ là một linear đọc từ `h_t`. CB0 và CB1–7 vì vậy có cùng dạng head.
 
 ### 5.1 Thay đổi so với C
 
@@ -300,10 +301,10 @@ Log:
 |---|---|---|---|---|---|
 | Backbone (Helium / Qwen) | LoRA | LoRA q,v | frozen | LoRA q,v | frozen / LoRA q,v |
 | `emb` audio | frozen | nếu `ft_embed` | **train** | nếu `ft_embed` | **train** / nếu `ft_embed` |
-| `stream_gains`, `layer_mix`, `cb0_head`, `cb0_text_adapter` | n/a | n/a | train | train | train |
+| `stream_gains`, `layer_mix`, `cb0_head`, `cb0_text_adapter`, `cb0_mlp` | n/a | n/a | train | train | train |
 | `backbone_proj`, `out_norm` | n/a | n/a | train | train | — |
 | `depformer_in`, `depformer_emb`, `linears[1:]`, `text_depth_adapter` | frozen | train | train | train | — |
-| `linears[0]`, `cb0_head` / `cb0_text_adapter`, `cb0_depth_gate` | — | — | theo `cb0_source` (mục 4.4) | theo `cb0_source` (mục 4.4) | chỉ `cb0_head` / `cb0_text_adapter` |
+| `linears[0]`, `cb0_head` / `cb0_text_adapter` / `cb0_mlp`, `cb0_depth_gate` | — | — | theo `cb0_source` (mục 4.4) | theo `cb0_source` (mục 4.4) | chỉ `cb0_head` / `cb0_text_adapter` / `cb0_mlp` |
 | `acoustic_heads` | — | — | — | — | train |
 | Depformer core | LoRA (tùy stage) | LoRA | frozen | LoRA (`depformer_mode: lora`) hoặc dense FP32 (`full`) | — |
 

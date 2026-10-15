@@ -849,13 +849,14 @@ def run(
     # Load LoRA weights before DDP wrapping; optimizer state is restored after wrapping.
     resume_checkpoint_dir = None
     adapter_resume_step = 0
+    fresh_params: list[str] = []
     if resume_adapter_file is not None:
         adapter_file = resume_adapter_file
         resume_checkpoint_dir = adapter_file.parent
         if accelerator.is_main_process:
             print(f"Resuming weights from {adapter_file}")
         if hasattr(runtime.model, "qwen"):
-            load_qwen_adapter(runtime.model, adapter_file, warm_start_heads=warm_start_heads)
+            fresh_params = load_qwen_adapter(runtime.model, adapter_file, warm_start_heads=warm_start_heads)
             if warm_start_heads and accelerator.is_main_process:
                 print("[Qwen Swap] warm-started the heads decoder: depformer keys dropped, acoustic_heads fresh")
             if convert_depformer_to_full:
@@ -879,6 +880,9 @@ def run(
             for key, value in checkpoint_modes(meta).items():
                 if value != getattr(config, key):
                     changes.append(f"{key} {value} -> {getattr(config, key)}")
+            # Parameters the checkpoint predates are not in its optimizer state.
+            if fresh_params:
+                changes.append(f"{len(fresh_params)} new parameters ({fresh_params[0]}, ...)")
             if changes:
                 resume_checkpoint_dir = None
                 adapter_resume_step = 0

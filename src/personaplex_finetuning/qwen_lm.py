@@ -140,26 +140,35 @@ class HiddenLayerMix(nn.Module):
         return mixed.to(hidden_states[-1].dtype)
 
 
-class AudioHead(nn.Module):
-    """One agent acoustic codebook predicted straight from the backbone feature.
+class ResidualMLP(nn.Module):
+    """Pre-norm SiLU MLP added to its input: ``x + down(silu(up(norm(x))))``.
 
-    RMSNorm, a residual SiLU MLP and a vocabulary projection. The MLP output
-    projection starts at zero, so a fresh head is a linear readout of the
-    normalized feature.
+    ``down`` starts at zero, so a fresh block is the identity and inserting it
+    in front of a trained readout leaves that readout's function unchanged.
     """
 
-    def __init__(self, dim: int, card: int, device=None, dtype=None) -> None:
+    def __init__(self, dim: int, device=None, dtype=None) -> None:
         super().__init__()
         factory_kwargs = {"device": device, "dtype": dtype}
         self.norm = nn.RMSNorm(dim, **factory_kwargs)
         self.up = nn.Linear(dim, dim, bias=False, **factory_kwargs)
         self.down = nn.Linear(dim, dim, bias=False, **factory_kwargs)
         nn.init.zeros_(self.down.weight)
-        self.out = nn.Linear(dim, card, bias=False, **factory_kwargs)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x + self.down(nn.functional.silu(self.up(self.norm(x))))
+
+
+class AudioHead(nn.Module):
+    """One agent acoustic codebook predicted straight from the backbone feature."""
+
+    def __init__(self, dim: int, card: int, device=None, dtype=None) -> None:
+        super().__init__()
+        self.mlp = ResidualMLP(dim, device=device, dtype=dtype)
+        self.out = nn.Linear(dim, card, bias=False, device=device, dtype=dtype)
 
     def forward(self, hidden: torch.Tensor) -> torch.Tensor:
-        x = self.norm(hidden)
-        return self.out(x + self.down(nn.functional.silu(self.up(x))))
+        return self.out(self.mlp(hidden))
 
 
 def _pca_init(table: torch.Tensor, dim: int) -> torch.Tensor:
@@ -292,6 +301,9 @@ class QwenMoshiLM(nn.Module):
         # did. Zero init: training starts from the unconditioned head.
         self.cb0_text_adapter = nn.Linear(dim, dim, bias=False, **factory_kwargs)
         nn.init.zeros_(self.cb0_text_adapter.weight)
+        # Nonlinear capacity in front of cb0_head. Starts as the identity, so
+        # checkpoints trained with the plain linear head keep their function.
+        self.cb0_mlp = ResidualMLP(dim, **factory_kwargs)
 
         if audio_decoder == "heads":
             if dep_q != n_q // 2:
@@ -453,7 +465,7 @@ class QwenMoshiLM(nn.Module):
 
     def cb0_logits(self, hidden: torch.Tensor, text_tokens: torch.Tensor) -> torch.Tensor:
         """Agent CB0 logits from the backbone feature and the frame's text token."""
-        return self.cb0_head(hidden + self.cb0_text_adapter(self._embed_text(text_tokens)))
+        return self.cb0_head(self.cb0_mlp(hidden + self.cb0_text_adapter(self._embed_text(text_tokens))))
 
     def depth_context(self, hidden: torch.Tensor) -> torch.Tensor:
         """Map the Qwen hidden state into the normalized Helium context space."""

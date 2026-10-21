@@ -161,7 +161,7 @@ class MockBenchmarkRunner:
 
 
 class PersonaPlexStreamingRunner:
-    """Streaming evaluator running directly on PersonaPlex (Base or LoRA)."""
+    """Streaming evaluator running on the PersonaPlex or Qwen backbone (base or adapter)."""
 
     def __init__(
         self,
@@ -169,11 +169,10 @@ class PersonaPlexStreamingRunner:
         adapter_path: Path | None = None,
         device: str = "auto",
         personaplex_source: Path | None = None,
+        config=None,
     ):
         import importlib
         import torch
-        from personaplex_finetuning.runtime import RuntimePaths, load_runtime
-        from personaplex_finetuning.lora import inject_lora, load_adapter
 
         # Resolve device
         if device == "auto" or device == "cuda" and not torch.cuda.is_available():
@@ -182,33 +181,63 @@ class PersonaPlexStreamingRunner:
             else:
                 device = "cpu"
         self.device = device
+        self.config = config
 
-        # Resolve source
-        source = personaplex_source
-        if source is None or not (source / "moshi" / "models" / "loaders.py").is_file():
-            candidates = [
-                Path("refs/personaplex-original/moshi"),
-                Path("../refs/personaplex-original/moshi"),
-                Path("../../refs/personaplex-original/moshi"),
-                Path("personaplex-finetuning/src"),
-            ]
-            for c in candidates:
-                if (c / "moshi" / "models" / "loaders.py").is_file():
-                    source = c
-                    break
-        if source is None or not (source / "moshi" / "models" / "loaders.py").is_file():
-            raise FileNotFoundError(f"Could not resolve PersonaPlex source containing moshi/models/loaders.py")
+        if config is not None:
+            from personaplex_finetuning.inference import attach_adapter, load_inference_runtime
 
-        self.runtime = load_runtime(
-            RuntimePaths(model_root, source),
-            device=device,
-            qlora=False,
-            quant_type=None,
-        )
+            config = config.replace(device=device)
+            self.config = config
+            self.runtime = load_inference_runtime(config)
+            if adapter_path is not None:
+                attach_adapter(config, self.runtime.model, adapter_path)
+            self.backbone = config.backbone
+        else:
+            from personaplex_finetuning.inference import _adapter_file
+            from personaplex_finetuning.lora import inject_lora, load_adapter
+            from personaplex_finetuning.peft_adapter import read_adapter_meta
+            from personaplex_finetuning.runtime import RuntimePaths, load_runtime
 
-        if adapter_path is not None and adapter_path.is_file():
-            inject_lora(self.runtime.model, rank=32, alpha=64.0)
-            load_adapter(self.runtime.model, adapter_path)
+            # Resolve source
+            source = personaplex_source
+            if source is None or not (source / "moshi" / "models" / "loaders.py").is_file():
+                candidates = [
+                    Path("refs/personaplex-original/moshi"),
+                    Path("../refs/personaplex-original/moshi"),
+                    Path("../../refs/personaplex-original/moshi"),
+                    Path("personaplex-finetuning/src"),
+                ]
+                for c in candidates:
+                    if (c / "moshi" / "models" / "loaders.py").is_file():
+                        source = c
+                        break
+            if source is None or not (source / "moshi" / "models" / "loaders.py").is_file():
+                raise FileNotFoundError(
+                    "Could not resolve PersonaPlex source containing moshi/models/loaders.py; "
+                    "pass --config so the backbone and source come from the run config"
+                )
+
+            self.runtime = load_runtime(
+                RuntimePaths(model_root, source),
+                device=device,
+                qlora=False,
+                quant_type=None,
+            )
+            self.backbone = "personaplex"
+            if adapter_path is not None:
+                adapter_file = _adapter_file(adapter_path)
+                meta = read_adapter_meta(adapter_file)
+                if meta.get("backbone") == "qwen":
+                    raise ValueError(
+                        f"adapter {adapter_file} was trained on the Qwen backbone; pass --config so "
+                        "the benchmark builds the matching runtime"
+                    )
+                inject_lora(
+                    self.runtime.model,
+                    rank=int(meta.get("rank", 32)),
+                    alpha=float(meta.get("alpha", 64.0)),
+                )
+                load_adapter(self.runtime.model, adapter_file)
 
         self.runtime.model.eval()
         self.lm_module = importlib.import_module("moshi.models.lm")
@@ -225,10 +254,13 @@ class PersonaPlexStreamingRunner:
             use_sampling=False,
         )
 
+        from personaplex_finetuning.text_normalization import encode_system_prompt
+
         generator.load_voice_prompt(str(sample.voice_prompt_wav))
-        generator.text_prompt_tokens = self.runtime.tokenizer.encode(
-            f"<system> {sample.text_prompt.strip()} <system>"
-        )
+        template = getattr(self.config, "text_prompt_template", "native") if self.config else "native"
+        if template == "auto":
+            template = "qwen" if self.backbone == "qwen" else "native"
+        generator.text_prompt_tokens = encode_system_prompt(self.runtime.tokenizer, sample.text_prompt, template)
 
         user_codes = self.runtime.codec.encode_conversation(
             sample.conversation_wav,
@@ -252,8 +284,12 @@ class PersonaPlexStreamingRunner:
                     continue
 
                 token_id = int(tokens[0, 0, 0])
-                if token_id not in (0, self.runtime.tokenizer.padding_id):
-                    piece = self.runtime.tokenizer._processor.id_to_piece(token_id).replace("▁", " ")
+                ignored = {0, int(self.runtime.tokenizer.padding_id),
+                           int(getattr(self.runtime.tokenizer, "end_padding_id", 0))}
+                if token_id not in ignored:
+                    from personaplex_finetuning.text_frames import token_piece
+
+                    piece = token_piece(self.runtime.tokenizer, token_id).replace("▁", " ").replace("Ġ", " ")
                     frame_tokens.append((curr_time, piece))
                     all_text_tokens.append(piece)
 

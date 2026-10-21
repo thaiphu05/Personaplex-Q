@@ -18,6 +18,7 @@ class Config:
     personaplex_source: Path
     prepared_dir: Path
     output_dir: Path
+    codec_cache_dir: Path | None = None
     seed: int = 42
     backbone: str = "personaplex"
     qwen_model_id: str | None = None
@@ -63,7 +64,7 @@ class Config:
     generation: dict[str, Any] = dataclasses.field(default_factory=dict)
     first_codebook_weight_multiplier: float = 1.0
     text_padding_weight: float = 0.3
-    epad_as_padding: bool = True
+    epad_as_padding: bool = False
     user_loss: bool = False
     text_prompt_template: str = "native"
     text_loss_weight: float = 1.0
@@ -194,6 +195,13 @@ def load_config(path: str | Path, overrides: list[str] | None = None) -> Config:
 
 
     prepared_dir = resolve(data, "prepared_dir") if "prepared_dir" in data else resolve(data, "manifest").parent
+    codec_cache_raw = data.get("codec_cache_dir", "auto")
+    if codec_cache_raw in (None, False) or str(codec_cache_raw).lower() in {"null", "none", "off", "false"}:
+        codec_cache_dir = None
+    elif str(codec_cache_raw).lower() == "auto":
+        codec_cache_dir = prepared_dir / ".mimi-cache"
+    else:
+        codec_cache_dir = resolve(data, "codec_cache_dir")
     qlora = bool(lora.get("qlora", False)) if isinstance(lora, dict) else False
     quant_type = str(lora.get("quant_type", "nf4")).lower() if isinstance(lora, dict) else "nf4"
     if quant_type not in {"nf4", "fp4"}:
@@ -289,6 +297,7 @@ def load_config(path: str | Path, overrides: list[str] | None = None) -> Config:
         ft_embed=bool(lora.get("ft_embed", False)) if isinstance(lora, dict) else False,
         qlora=qlora,
         quant_type=quant_type,
+        codec_cache_dir=codec_cache_dir,
         device=str(model.get("device", "cuda")),
         gradient_accumulation_steps=max(1, int(train.get("gradient_accumulation_steps", 1))) if isinstance(train, dict) else 1,
         warmup_steps=max(0, int(train.get("warmup_steps", 0))) if isinstance(train, dict) else 0,

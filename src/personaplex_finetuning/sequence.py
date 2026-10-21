@@ -80,7 +80,11 @@ class PersonaPlexTrainingExampleBuilder:
             raise ValueError("PersonaPlex requires 8 codebooks per speaker and 17 initial tokens")
 
     def build(self, sample: PreparedSample) -> TrainingExample:
-        if hasattr(self.codec, "encode_conversation_stereo"):
+        if hasattr(self.codec, "encode_conversation_stereo_cached"):
+            agent, user = self.codec.encode_conversation_stereo_cached(
+                sample.conversation_wav, sample.agent_channel, sample.user_channel, sample.window_start_sec, sample.window_end_sec
+            )
+        elif hasattr(self.codec, "encode_conversation_stereo"):
             agent, user = self.codec.encode_conversation_stereo(
                 sample.conversation_wav, sample.agent_channel, sample.user_channel, sample.window_start_sec, sample.window_end_sec
             )

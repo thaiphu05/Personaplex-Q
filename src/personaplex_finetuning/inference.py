@@ -68,8 +68,15 @@ def load_inference_runtime(config: Config):
             str(config.device),
             cb0_source=getattr(config, "cb0_source", "qwen"),
             audio_decoder=getattr(config, "audio_decoder", "depformer"),
+            codec_cache_dir=getattr(config, "codec_cache_dir", None),
         )
-    return load_runtime(RuntimePaths(config.model_root, config.personaplex_source), config.device, config.qlora, config.quant_type)
+    return load_runtime(
+        RuntimePaths(config.model_root, config.personaplex_source),
+        config.device,
+        config.qlora,
+        config.quant_type,
+        codec_cache_dir=getattr(config, "codec_cache_dir", None),
+    )
 
 
 def attach_adapter(config: Config, model, adapter: Path) -> None:

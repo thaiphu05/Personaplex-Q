@@ -80,6 +80,7 @@ class MimiCodec:
         self._helpers = lm_helpers
         self._voice_cache: dict[str, tuple[tuple[int, ...], ...]] = {}
         self._cache_dir = cache_dir  # Optional persistent disk cache for conversation encoding
+        self.cache_stats = {"hit": 0, "encoded": 0, "error": 0}
 
     def encode_conversation_stereo(self, path: Path, agent_channel: int, user_channel: int, start_sec: float, end_sec: float):
         import numpy as np
@@ -111,16 +112,42 @@ class MimiCodec:
         if self._cache_dir is None:
             return self.encode_conversation_stereo(path, agent_channel, user_channel, start_sec, end_sec)
 
+        import hashlib
         import torch
-        key = f"{path.name}_ch{agent_channel}{user_channel}_{start_sec:.3f}_{end_sec:.3f}"
-        cache_file = self._cache_dir / (key + ".pt")
+
+        path = Path(path)
+        stat = path.stat()
+        identity = "|".join(
+            (
+                hashlib.sha1(str(path.resolve()).encode("utf-8")).hexdigest()[:16],
+                str(stat.st_size),
+                str(stat.st_mtime_ns),
+                str(agent_channel),
+                str(user_channel),
+                f"{start_sec:.3f}",
+                f"{end_sec:.3f}",
+                f"{self.frame_rate:.3f}",
+            )
+        )
+        cache_file = self._cache_dir / (hashlib.sha1(identity.encode("utf-8")).hexdigest() + ".pt")
         if cache_file.is_file():
             data = torch.load(str(cache_file), map_location="cpu", weights_only=True)
-            return data["agent"], data["user"]
+            if data.get("version") == 1 and data.get("identity") == identity:
+                self.cache_stats["hit"] += 1
+                return data["agent"], data["user"]
 
         agent_codes, user_codes = self.encode_conversation_stereo(path, agent_channel, user_channel, start_sec, end_sec)
-        self._cache_dir.mkdir(parents=True, exist_ok=True)
-        torch.save({"agent": agent_codes, "user": user_codes}, str(cache_file))
+        try:
+            self._cache_dir.mkdir(parents=True, exist_ok=True)
+            torch.save(
+                {"version": 1, "identity": identity, "agent": agent_codes, "user": user_codes},
+                str(cache_file),
+            )
+        except OSError:
+            # A read-only prepared directory must never break training: keep running live.
+            self.cache_stats["error"] += 1
+            self._cache_dir = None
+        self.cache_stats["encoded"] += 1
         return agent_codes, user_codes
 
     def encode_conversation(self, path: Path, channel: int, start_sec: float, end_sec: float):
@@ -209,7 +236,8 @@ def _steal_pp_module(pp_model, name: str):
 
 
 def load_qwen_runtime(
-    paths: QwenRuntimePaths, device: str = "cuda", cb0_source: str = "qwen", audio_decoder: str = "depformer"
+    paths: QwenRuntimePaths, device: str = "cuda", cb0_source: str = "qwen",
+    audio_decoder: str = "depformer", codec_cache_dir: Path | None = None,
 ) -> PersonaPlexRuntime:
     """Build the Qwen-swap runtime from local PersonaPlex assets + a Qwen model.
 
@@ -319,7 +347,7 @@ def load_qwen_runtime(
 
     # 4. Mimi codec (frozen) for conversation encoding.
     mimi = loaders.get_mimi(resolved.mimi_weight, device=device)
-    codec = MimiCodec(mimi, mimi.sample_rate, mimi.frame_rate, device, lm_helpers)
+    codec = MimiCodec(mimi, mimi.sample_rate, mimi.frame_rate, device, lm_helpers, cache_dir=codec_cache_dir)
 
     initial_tokens = tuple(int(value) for value in model._get_initial_token()[0, :, 0].tolist())
     if len(initial_tokens) != 17:
@@ -335,7 +363,10 @@ def load_qwen_runtime(
     )
 
 
-def load_runtime(paths: RuntimePaths, device: str = "cuda", qlora: bool = False, quant_type: str = "nf4") -> PersonaPlexRuntime:
+def load_runtime(
+    paths: RuntimePaths, device: str = "cuda", qlora: bool = False, quant_type: str = "nf4",
+    codec_cache_dir: Path | None = None,
+) -> PersonaPlexRuntime:
     """Load from explicit local assets only. No Hugging Face function is imported."""
     resolved = paths.validate()
     source = str(resolved.source)
@@ -378,7 +409,7 @@ def load_runtime(paths: RuntimePaths, device: str = "cuda", qlora: bool = False,
         raise RuntimeError("loaded checkpoint is not the expected 17-stream PersonaPlex model")
     return PersonaPlexRuntime(
         model=model,
-        codec=MimiCodec(mimi, mimi.sample_rate, mimi.frame_rate, device, lm_helpers),
+        codec=MimiCodec(mimi, mimi.sample_rate, mimi.frame_rate, device, lm_helpers, cache_dir=codec_cache_dir),
         tokenizer=SentencePieceTokenizer(resolved.tokenizer),
         initial_tokens=initial,
         zero_token=int(model.zero_token_id),

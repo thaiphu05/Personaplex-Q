@@ -41,6 +41,27 @@ from .runtime import QwenRuntimePaths, RuntimePaths, load_qwen_runtime, load_run
 from .sequence import PersonaPlexTrainingExampleBuilder
 from .train_utils import sample_position_for_step, write_val_scalars
 
+LOSS_WEIGHT_KEYS = (
+    "first_codebook_weight_multiplier",
+    "nonsemantic_audio_weight",
+    "text_padding_weight",
+    "text_loss_weight",
+    "epad_as_padding",
+    "user_loss",
+)
+
+
+def loss_weight_record(config: Config) -> dict:
+    """Loss weights recorded with every run and checkpoint, so runs stay comparable."""
+    return {key: getattr(config, key) for key in LOSS_WEIGHT_KEYS}
+
+
+def adapter_rank_alpha(config: Config) -> tuple[int, int]:
+    """Adapter rank/alpha of the active backbone (Qwen and PersonaPlex differ)."""
+    if config.backbone == "qwen":
+        return config.lora_qwen_rank, config.lora_qwen_alpha
+    return config.lora_rank, config.lora_alpha
+
 
 def limit_cpu_threads(torch_module) -> int:
     """Keep training processes from consuming every CPU core."""
@@ -450,10 +471,13 @@ def save_adapter(run_dir: Path, model, config: Config, step: int, optimizer=None
     adapter = path / "lora.safetensors"
     state = qwen_adapter_state_dict(model) if hasattr(model, "qwen") else adapter_state_dict(model)
     save_file(state, str(adapter))
+    rank, alpha = adapter_rank_alpha(config)
     (path / "adapter.json").write_text(
         json.dumps(
-            {"step": step, "train_stage": config.train_stage, "cb0_source": config.cb0_source, "depformer_mode": config.depformer_mode, "audio_decoder": config.audio_decoder, "model_root": str(config.model_root), "rank": config.lora_rank, "alpha": config.lora_alpha,
-             "gradient_accumulation_steps": gradient_accumulation_steps, "num_processes": num_processes},
+            {"step": step, "train_stage": config.train_stage, "cb0_source": config.cb0_source, "depformer_mode": config.depformer_mode, "audio_decoder": config.audio_decoder, "model_root": str(config.model_root), "rank": rank, "alpha": alpha,
+             "backbone": config.backbone, "qwen_id": config.qwen_model_id,
+             "gradient_accumulation_steps": gradient_accumulation_steps, "num_processes": num_processes,
+             **loss_weight_record(config)},
             indent=2,
         )
     )
@@ -471,10 +495,13 @@ def save_best_adapter(
     adapter = path / "lora.safetensors"
     state = qwen_adapter_state_dict(model) if hasattr(model, "qwen") else adapter_state_dict(model)
     save_file(state, str(adapter))
+    rank, alpha = adapter_rank_alpha(config)
     (path / "adapter.json").write_text(
         json.dumps(
-            {"step": step, "val_loss": val_loss, "train_stage": config.train_stage, "cb0_source": config.cb0_source, "depformer_mode": config.depformer_mode, "audio_decoder": config.audio_decoder, "model_root": str(config.model_root), "rank": config.lora_rank, "alpha": config.lora_alpha,
-             "gradient_accumulation_steps": gradient_accumulation_steps, "num_processes": num_processes},
+            {"step": step, "val_loss": val_loss, "criterion": "val_loss", "train_stage": config.train_stage, "cb0_source": config.cb0_source, "depformer_mode": config.depformer_mode, "audio_decoder": config.audio_decoder, "model_root": str(config.model_root), "rank": rank, "alpha": alpha,
+             "backbone": config.backbone, "qwen_id": config.qwen_model_id,
+             "gradient_accumulation_steps": gradient_accumulation_steps, "num_processes": num_processes,
+             **loss_weight_record(config)},
             indent=2,
         )
     )
@@ -551,6 +578,7 @@ def verify_reloaded_adapter(config: Config, sample, adapter: Path) -> float:
             config.device,
             cb0_source=config.cb0_source,
             audio_decoder=config.audio_decoder,
+            codec_cache_dir=getattr(config, "codec_cache_dir", None),
         )
         build_qwen_adapters(fresh.model, config)
         load_qwen_adapter(fresh.model, adapter)
@@ -577,7 +605,7 @@ def verify_reloaded_adapter(config: Config, sample, adapter: Path) -> float:
 
 
 def run_final_evaluation(config: Config, runtime, model, val_samples: list, run_dir: Path, writer,
-                         step: int, checkpoint: Path | None) -> dict | None:
+                         step: int, checkpoint: Path | None, asr=None) -> dict | None:
     """Score the trained model on unseen samples and write ``<run>/eval``.
 
     Samples come from ``data.eval_manifest`` when set, else this run's own
@@ -603,7 +631,7 @@ def run_final_evaluation(config: Config, runtime, model, val_samples: list, run_
     try:
         report = evaluate_samples(
             config, runtime, model, samples, run_dir / "eval", gen_cfg=config.generation,
-            checkpoint=str(checkpoint) if checkpoint else None, manifest=source,
+            checkpoint=str(checkpoint) if checkpoint else None, manifest=source, asr=asr,
         )
     except Exception as exc:  # evaluation must never fail a finished training run
         tqdm.write(json.dumps({"event": "final_eval_error", "error": str(exc)}))
@@ -626,6 +654,7 @@ def run(
     smoke: bool = False,
     resume_from: str | None = None,
     reset_scheduler: bool = False,
+    asr=None,
 ) -> Path | None:
     for variable in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
         os.environ[variable] = "1"
@@ -704,6 +733,7 @@ def run(
             "num_train_samples": len(train_samples),
             "num_val_samples": len(val_samples),
             "num_train_role_views": len(train_samples) * (2 if config.swap_roles_after_pass else 1),
+            **loss_weight_record(config),
         }
         (run_dir / "config.json").write_text(json.dumps(config_record, indent=2) + "\n", encoding="utf-8")
         print(json.dumps(config_record))
@@ -728,6 +758,7 @@ def run(
                     str(device),
                     cb0_source=config.cb0_source,
                     audio_decoder=config.audio_decoder,
+                    codec_cache_dir=getattr(config, "codec_cache_dir", None),
                 )
             else:
                 runtime = load_runtime(
@@ -735,6 +766,7 @@ def run(
                     str(device),
                     config.qlora,
                     config.quant_type,
+                    codec_cache_dir=getattr(config, "codec_cache_dir", None),
                 )
         accelerator.wait_for_everyone()
 
@@ -787,6 +819,16 @@ def run(
         if not resume_adapter_file.is_file():
             raise FileNotFoundError(f"resume adapter does not exist: {resume_adapter_file}")
     resume_meta = read_adapter_meta(resume_adapter_file) if resume_adapter_file else {}
+    if resume_meta and accelerator.is_main_process:
+        current_weights = loss_weight_record(config)
+        saved_weights = {key: resume_meta[key] for key in LOSS_WEIGHT_KEYS if key in resume_meta}
+        mismatched = {
+            key: {"checkpoint": saved_weights[key], "config": current_weights[key]}
+            for key in saved_weights
+            if saved_weights[key] != current_weights[key]
+        }
+        if mismatched:
+            tqdm.write(json.dumps({"event": "resume_loss_weight_mismatch", "differences": mismatched}))
 
     # Inject LoRA with Stage-Wise Freezing support
     convert_depformer_to_full = False
@@ -1134,6 +1176,7 @@ def run(
                 unwrapped = accelerator.unwrap_model(runtime.model)
                 was_training = unwrapped.training
                 infer_error = None
+                generation_scores: list[dict] = []
                 unwrapped.eval()
                 try:
                     for sample in (val_samples or train_samples)[: config.infer_samples]:
@@ -1147,15 +1190,37 @@ def run(
                             )
                             export_stereo(sample_dir)
                             infer_outputs.append(str(sample_dir))
+                            if asr is not None:
+                                from .evaluate import cer, reference_agent_text, wer
+
+                                words = asr.transcribe_words(sample_dir / "agent.wav")
+                                (sample_dir / "asr.json").write_text(
+                                    json.dumps(words, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+                                )
+                                hypothesis = " ".join(word["word"] for word in words)
+                                reference = reference_agent_text(sample)
+                                generation_scores.append(
+                                    {
+                                        "sample_id": sample.sample_id,
+                                        "cer": cer(reference, hypothesis),
+                                        "wer": wer(reference, hypothesis),
+                                    }
+                                )
                         except Exception as exc:  # a failed sample must never kill training
                             infer_error = f"{sample.sample_id}: {exc}"
                             tqdm.write(json.dumps({"event": "inference_error", "step": optimizer_step, "error": infer_error}))
                 finally:
                     unwrapped.train(was_training)
+                if generation_scores and writer is not None:
+                    for key in ("cer", "wer"):
+                        values = [row[key] for row in generation_scores if row[key] is not None]
+                        if values:
+                            writer.add_scalar(f"val/generation_{key}", sum(values) / len(values), optimizer_step)
                 tqdm.write(json.dumps({
                     "event": "inference_samples",
                     "step": optimizer_step,
                     "infer_error": infer_error,
+                    "generation_scores": generation_scores,
                     "outputs": infer_outputs[-config.infer_samples:],
                 }))
 
@@ -1164,7 +1229,7 @@ def run(
             if accelerator.is_main_process:
                 final_eval = run_final_evaluation(
                     config, runtime, accelerator.unwrap_model(runtime.model), val_samples, run_dir, writer,
-                    max_steps, saved.parent if saved else None,
+                    max_steps, saved.parent if saved else None, asr=asr,
                 )
             accelerator.wait_for_everyone()
 
@@ -1223,6 +1288,9 @@ def main() -> int:
     parser.add_argument("--no-qlora", dest="qlora", action="store_false", help="Disable QLoRA")
     parser.add_argument("--resume-from", type=str, default=None, help="Path to checkpoint directory to resume from")
     parser.add_argument("--reset-scheduler", action="store_true", help="Restart the LR schedule from config values when resuming (keeps weights and data position)")
+    parser.add_argument("--asr-model", type=str, default=None, help="Local Whisper .pt file or HF directory for generated-audio CER/WER")
+    parser.add_argument("--asr-language", type=str, default="vi", help="ASR language code (default: vi)")
+    parser.add_argument("--asr-device", type=str, default=None, help="ASR device (default: model.device)")
 
     args, unknown = parser.parse_known_args()
     overrides = [arg for arg in unknown if "=" in arg]
@@ -1237,12 +1305,22 @@ def main() -> int:
     config = load_config(config_path, overrides=overrides)
     if args.qlora is not None:
         config = config.replace(qlora=args.qlora)
+    asr = None
+    if args.asr_model:
+        from .asr import WhisperWordASR
+
+        asr = WhisperWordASR(
+            Path(args.asr_model),
+            language=args.asr_language,
+            device=args.asr_device or str(config.device),
+        )
 
     run(
         config,
         smoke=args.smoke,
         resume_from=args.resume_from,
         reset_scheduler=args.reset_scheduler,
+        asr=asr,
     )
     return 0
 

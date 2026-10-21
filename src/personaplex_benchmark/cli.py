@@ -13,6 +13,7 @@ from .reporter import BenchmarkReporter, aggregate_results, AggregatedTaskMetric
 
 def run_benchmark_cli(args: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run Full-Duplex-Bench on PersonaPlex models.")
+    parser.add_argument("--config", type=Path, default=None, help="Training/eval config; selects the PersonaPlex or Qwen backbone.")
     parser.add_argument("--model_root", type=Path, default=Path("models"), help="Path to base PersonaPlex checkpoint directory.")
     parser.add_argument("--adapter", type=Path, default=None, help="Optional path to fine-tuned LoRA adapter.")
     parser.add_argument("--model_name", type=str, default="PersonaPlex Base", help="Display name of the model.")
@@ -104,10 +105,18 @@ def run_benchmark_cli(args: list[str] | None = None) -> int:
 
     else:
         console.print(f"\n[bold green]Initializing PersonaPlex Streaming Runner on {parsed.device}...[/bold green]")
+        config = None
+        model_root = parsed.model_root
+        if parsed.config is not None:
+            from personaplex_finetuning.config import load_config
+
+            config = load_config(parsed.config)
+            model_root = config.model_root
         runner = PersonaPlexStreamingRunner(
-            model_root=parsed.model_root,
+            model_root=model_root,
             adapter_path=parsed.adapter,
             device=parsed.device,
+            config=config,
         )
         results = []
         for i, s in enumerate(capped_samples):

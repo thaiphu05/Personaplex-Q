@@ -6,7 +6,8 @@ and teacher-forced accuracies (``metrics.json``) with the target text
 (``ref_agent.txt``). ``summary.json`` collects per-sample results and means.
 
 python -m personaplex_finetuning.evaluate --config configs/qwen3-0.6b.yaml \
-    --checkpoint runs/<run> [--manifest <prepared>/val.jsonl] [--limit 10]
+    --checkpoint runs/<run> [--manifest <prepared>/val.jsonl] [--limit 10] \
+    [--asr-model /models/whisper-large-v3.pt --asr-language vi]
 
 ``train.run`` calls ``evaluate_samples`` on the run's validation samples when
 ``train.final_eval_samples`` > 0, writing to ``<run>/eval``.
@@ -18,6 +19,7 @@ import argparse
 import json
 import logging
 import re
+import unicodedata
 from pathlib import Path
 
 from .config import Config
@@ -26,7 +28,51 @@ from .data import PreparedSample
 logger = logging.getLogger(__name__)
 
 AGENT_CODEBOOKS = 8
-METRIC_KEYS = ("agent_cb0_acc", "agent_all_cb_acc", "text_word_acc")
+METRIC_KEYS = ("agent_cb0_acc", "agent_all_cb_acc", "text_word_acc", "cer", "wer", "speech_rate")
+
+
+def _normalize_words(text: str) -> list[str]:
+    text = unicodedata.normalize("NFC", text).lower()
+    text = re.sub(r"[^\w\s]", " ", text, flags=re.UNICODE)
+    return text.split()
+
+
+def _edit_distance(reference: list, hypothesis: list) -> int:
+    if not reference:
+        return len(hypothesis)
+    previous = list(range(len(hypothesis) + 1))
+    for ref_index, ref_item in enumerate(reference, 1):
+        current = [ref_index]
+        for hyp_index, hyp_item in enumerate(hypothesis, 1):
+            cost = 0 if ref_item == hyp_item else 1
+            current.append(min(current[-1] + 1, previous[hyp_index] + 1, previous[hyp_index - 1] + cost))
+        previous = current
+    return previous[-1]
+
+
+def cer(reference: str, hypothesis: str) -> float | None:
+    """Character error rate on normalized text (Vietnamese diacritics preserved)."""
+    reference_chars = list(" ".join(_normalize_words(reference)))
+    hypothesis_chars = list(" ".join(_normalize_words(hypothesis)))
+    if not reference_chars:
+        return None
+    return _edit_distance(reference_chars, hypothesis_chars) / len(reference_chars)
+
+
+def wer(reference: str, hypothesis: str) -> float | None:
+    """Word error rate on normalized text."""
+    reference_words = _normalize_words(reference)
+    if not reference_words:
+        return None
+    return _edit_distance(reference_words, _normalize_words(hypothesis)) / len(reference_words)
+
+
+def reference_agent_text(sample: PreparedSample) -> str:
+    """Agent words inside the evaluated window, in order."""
+    words = getattr(sample, "words", ()) or ()
+    start = float(getattr(sample, "window_start_sec", 0.0))
+    end = float(getattr(sample, "window_end_sec", float("inf")))
+    return " ".join(word.word for word in words if word.speaker == "agent" and start <= word.start < end)
 
 
 def teacher_forced_summary(output, example, filler_ids, torch) -> dict:
@@ -117,10 +163,12 @@ def resolve_checkpoint(path: Path) -> Path:
 
 def evaluate_samples(config: Config, runtime, model, samples: list[PreparedSample], output_dir: Path,
                      gen_cfg: dict | None = None, checkpoint: str | None = None,
-                     manifest: str | None = None) -> dict:
+                     manifest: str | None = None, asr=None) -> dict:
     """Generate and score every sample with an already loaded model; write ``summary.json``.
 
-    A failing sample is recorded with its error and does not stop the others.
+    ``asr`` is an optional ``WhisperWordASR`` instance; without it the audio is
+    still generated but ``cer``/``wer`` stay ``None``. A failing sample is
+    recorded with its error and does not stop the others.
     """
     from .inference import _export_context, decode_text, export_stereo, generate
 
@@ -139,6 +187,21 @@ def evaluate_samples(config: Config, runtime, model, samples: list[PreparedSampl
             export_stereo(sample_dir)
             summary = teacher_forced(config, runtime, model, sample)
             (sample_dir / "ref_agent.txt").write_text(decode_text(config, runtime, summary["ref_ids"]), encoding="utf-8")
+            asr_metrics = {"cer": None, "wer": None, "speech_rate": None}
+            if asr is not None:
+                words = asr.transcribe_words(sample_dir / "agent.wav")
+                (sample_dir / "asr.json").write_text(
+                    json.dumps(words, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+                )
+                hypothesis = " ".join(word["word"] for word in words)
+                reference = reference_agent_text(sample)
+                duration = max(1e-9, float(sample.window_end_sec) - float(sample.window_start_sec))
+                asr_metrics = {
+                    "cer": cer(reference, hypothesis),
+                    "wer": wer(reference, hypothesis),
+                    "speech_rate": len(_normalize_words(hypothesis)) / duration,
+                }
+            summary["metrics"].update(asr_metrics)
             (sample_dir / "metrics.json").write_text(json.dumps(summary["metrics"], indent=2))
             results.append({"sample_id": sample.sample_id, "metrics": summary["metrics"], "error": None})
         except Exception as exc:  # one bad sample must not abort the evaluation
@@ -153,6 +216,7 @@ def evaluate_samples(config: Config, runtime, model, samples: list[PreparedSampl
     report = {
         "checkpoint": checkpoint,
         "manifest": manifest,
+        "asr_model": str(asr.model_path) if asr is not None else None,
         "count": len(results),
         "failed": sum(result["error"] is not None for result in results),
         "mean": mean,
@@ -196,10 +260,22 @@ def main() -> int:
     parser.add_argument("--limit", type=int, default=10, help="Max samples (0 = all)")
     parser.add_argument("--sample-id", action="append", default=None, help="Evaluate only these sample ids (repeatable)")
     parser.add_argument("--output-dir", default=None, help="Default: <checkpoint dir>/eval_<manifest name>")
+    parser.add_argument("--asr-model", default=None, help="Local Whisper .pt file or HF directory (enables CER/WER)")
+    parser.add_argument("--asr-language", default="vi", help="ASR language code (default: vi)")
+    parser.add_argument("--asr-device", default=None, help="ASR device (default: model.device)")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO)
     config = load_config(args.config)
+    asr = None
+    if args.asr_model:
+        from .asr import WhisperWordASR
+
+        asr = WhisperWordASR(
+            Path(args.asr_model),
+            language=args.asr_language,
+            device=args.asr_device or str(config.device),
+        )
     adapter = resolve_checkpoint(Path(args.checkpoint)).resolve()
     manifest = Path(args.manifest).resolve() if args.manifest else default_manifest(config)
     samples = select_samples(
@@ -214,7 +290,7 @@ def main() -> int:
     model.eval()
     report = evaluate_samples(
         config, runtime, model, samples, output_dir, gen_cfg=config.generation,
-        checkpoint=str(adapter), manifest=str(manifest),
+        checkpoint=str(adapter), manifest=str(manifest), asr=asr,
     )
     print(json.dumps({key: report[key] for key in ("count", "failed", "mean")}, indent=2))
     return 0

@@ -350,10 +350,11 @@ The trainer accepts plain `key=value` overrides and maps them to config sections
 | `qwen_rank=`, `qwen_alpha=`, `depformer_rank=`, `depformer_alpha=`, `ft_embed=`, `qwen_targets=` | `lora.*` | |
 | `backbone=`, `qwen_id=`, `device=` | `model.*` | `device=` auto-prefixed to `model.device` |
 | `window_seconds=`, `shuffle=` | `data.*` | |
-| `data.prepared_dir=`, `data.val_manifest=`, `data.val_ratio=`, `data.static_chunking=`, `data.swap_roles_after_pass=`, `data.random_crop=`, `data.prompt_aug_prob=` | `data.*` | dotted overrides pass through to Hydra |
+| `data.prepared_dir=`, `data.val_manifest=`, `data.val_ratio=`, `data.static_chunking=`, `data.swap_roles_after_pass=`, `data.random_crop=`, `data.prompt_aug_prob=`, `data.codec_cache_dir=` | `data.*` | dotted overrides pass through to Hydra; cache `auto` = `<prepared_dir>/.mimi-cache`, `null` disables |
+| `text_padding_weight=`, `text_loss_weight=`, `epad_as_padding=`, `user_loss=`, `nonsemantic_audio_weight=` | top-level | Legacy text recipe: `text_padding_weight=0.01 text_loss_weight=0.2` |
 | `gpus=` / `gpu=` / `devices=` / `device_ids=` | ignored | Only meaningful for `scripts/train_gpus.sh` |
 
-Full key reference for standalone configs: see `configs/config_example.yaml` (documents every parsed key, including loss weights which are hardcoded in `src/personaplex_finetuning/objective.py`).
+Full key reference for standalone configs: see `configs/config_example.yaml`.
 
 ### 4.7 Outputs
 
@@ -449,6 +450,25 @@ python -m tools.inference_smoke \
 Flags: `--config` (required), `--adapter` (required), `--index` (default `0`), `--start` (window start in seconds; must stay within the audio), `--input-path`/`--input-file` (optional external WAV/MP3 instead of sample audio), `--output-dir` (default `outputs/smoke`).
 
 Outputs: `dialogue_original.wav` (source dialogue cropped to the inference window), `user.wav`, and base-model vs adapter-generated audio/text. `finetuned.txt` may be empty when free generation produces no valid text tokens — training loss measures teacher-forced prediction, not greedy inference transcripts.
+
+### 5.4 Evaluate a checkpoint (teacher-forced + optional CER/WER)
+
+```bash
+# teacher-forced accuracies only
+python -m personaplex_finetuning.evaluate \
+  --config configs/qwen3-0.6b.yaml \
+  --checkpoint runs/qwen3-06b/checkpoints/best \
+  --limit 5
+
+# add generated-audio CER/WER: the ASR model is always passed explicitly
+python -m personaplex_finetuning.evaluate \
+  --config configs/qwen3-0.6b.yaml \
+  --checkpoint runs/qwen3-06b/checkpoints/best \
+  --asr-model /models/whisper-large-v3.pt --asr-language vi \
+  --limit 5
+```
+
+`--asr-model` accepts a local openai-whisper `.pt` file or a Hugging Face Whisper directory (install `openai-whisper` for the `.pt` form). Without it, `cer`/`wer` stay `null`; nothing is downloaded automatically. `best` checkpoints are still selected by validation loss, not CER.
 
 ---
 

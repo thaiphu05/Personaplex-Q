@@ -70,7 +70,7 @@ generation:
 # total = text_loss_weight * text + audio (CB0 + acoustic, chung mẫu số)
 first_codebook_weight_multiplier: 1.0   # semantic codebook (CB0) weight
 nonsemantic_audio_weight: 0.02          # acoustic codebook CB1-7 weight
-text_padding_weight: 0.3                # PAD weight; EPAD tùy epad_as_padding
+text_padding_weight: 0.5                # PAD weight; EPAD tùy epad_as_padding
 text_loss_weight: 1.0                   # hệ số nhân text loss so với audio
 epad_as_padding: false                  # true = EPAD (word onset) xuống mức PAD
 user_loss: false                        # true = supervise cả user audio streams

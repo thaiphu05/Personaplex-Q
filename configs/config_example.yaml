@@ -149,12 +149,14 @@ train:
   mixed_precision: bf16
 
 # ==============================================================================
-# 5. LOSS WEIGHTS — KHÔNG parse từ config (hardcode trong objective.py)
-#    Muốn đổi: sửa mặc định trong src/personaplex_finetuning/objective.py
-#    - nonsemantic_audio_weight: 0.02   (codebook 2-8)
-#    - text_padding_weight: 0.3         (token padding text)
-#    - codebook 0 (semantic): trọng số 1.0
-#    - user stream (9-16): weight 0
+# 5. LOSS WEIGHTS — parse từ config (top-level, không nằm trong section)
+#    - first_codebook_weight_multiplier: 1.0   (CB0 semantic)
+#    - nonsemantic_audio_weight: 0.02          (codebook 2-8)
+#    - text_padding_weight: 0.5                (PAD; Qwen preset = FT1 parity)
+#    - text_loss_weight: 1.0                   (hệ số nhân text loss)
+#    - epad_as_padding: false                  (false = EPAD giữ weight 1.0)
+#    - user_loss: false                        (true = supervise user stream)
+#    Legacy recipe: text_padding_weight=0.01 text_loss_weight=0.2
 #    - vùng system prompt: mask (không học)
 # ==============================================================================
 

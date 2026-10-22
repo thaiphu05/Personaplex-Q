@@ -9,7 +9,7 @@ from dataclasses import replace
 from pathlib import Path
 
 from .config import Config
-from .data import PreparedSample
+from .data import AudioInfo, PreparedSample
 from .lora import inject_lora, load_adapter
 from .peft_adapter import CHECKPOINT_MODE_DEFAULTS, build_qwen_adapters, checkpoint_modes, load_qwen_adapter, read_adapter_meta
 from .runtime import QwenRuntimePaths, RuntimePaths, load_qwen_runtime, load_runtime
@@ -375,3 +375,122 @@ def smoke(
             indent=2,
         )
     )
+
+
+def collect_audio_files(
+    input_dir: Path,
+    extensions: tuple[str, ...] = ("wav", "mp3", "flac"),
+    recursive: bool = False,
+    limit: int | None = None,
+) -> list[Path]:
+    """Audio files under ``input_dir``, sorted, with case-insensitive extensions."""
+    input_dir = Path(input_dir)
+    if not input_dir.is_dir():
+        raise FileNotFoundError(f"input directory does not exist: {input_dir}")
+    suffixes = {f".{ext.lower().lstrip('.')}" for ext in extensions}
+    iterator = input_dir.rglob("*") if recursive else input_dir.glob("*")
+    files = sorted(path for path in iterator if path.is_file() and path.suffix.lower() in suffixes)
+    return files[:limit] if limit else files
+
+
+def generate_folder(
+    config: Config,
+    input_dir: Path,
+    adapter: Path,
+    output_dir: Path,
+    *,
+    voice_prompt_wav: Path,
+    text_prompt: str,
+    extensions: tuple[str, ...] = ("wav", "mp3", "flac"),
+    recursive: bool = False,
+    limit: int | None = None,
+) -> dict:
+    """Run one adapter over every audio file in ``input_dir``.
+
+    The model loads once; every file is treated as the user channel, with the
+    same voice prompt and system text prompt. Outputs per file:
+    ``agent.wav``, ``agent.txt``, ``user.wav``, ``dialogue_stereo.wav``,
+    ``input_24k.wav``, ``prompt_voice.wav`` and ``run.json``.
+    """
+    import sphn
+
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    files = collect_audio_files(input_dir, extensions, recursive, limit)
+    if not files:
+        raise FileNotFoundError(
+            f"no audio files ({', '.join(extensions)}) under {input_dir}"
+        )
+
+    runtime = load_inference_runtime(config)
+    model = runtime.model
+    attach_adapter(config, model, adapter)
+    model.eval()
+    gen_cfg = config.generation
+
+    entries = []
+    for index, source in enumerate(files, 1):
+        file_dir = output_dir / source.stem
+        file_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            normalized = _prepare_input_audio(source, file_dir)
+            audio, sample_rate = sphn.read(str(normalized))
+            duration = float(audio.shape[-1]) / float(sample_rate)
+            if duration <= 0:
+                raise ValueError(f"empty audio: {source}")
+            sample = PreparedSample(
+                sample_id=source.stem,
+                conversation_wav=normalized,
+                voice_prompt_wav=Path(voice_prompt_wav),
+                words=(),
+                text_prompt=text_prompt,
+                metadata={"source_file": str(source)},
+                audio=AudioInfo(sample_rate=sample_rate, channels=int(audio.shape[0]) if audio.ndim > 1 else 1,
+                                duration_sec=duration),
+                window_start_sec=0.0,
+                window_end_sec=duration,
+                agent_channel=0,
+                user_channel=0,
+            )
+            _export_context(sample, file_dir)
+            generate(
+                config, sample, file_dir / "agent.wav", file_dir / "agent.txt",
+                adapter=None, runtime=runtime, model=model, gen_cfg=gen_cfg,
+            )
+            export_stereo(file_dir)
+            (file_dir / "run.json").write_text(
+                json.dumps(
+                    {
+                        "source_file": str(source),
+                        "sample_id": sample.sample_id,
+                        "duration_sec": duration,
+                        "adapter": str(adapter),
+                        "voice_prompt": str(voice_prompt_wav),
+                        "text_prompt": text_prompt,
+                        "cb0_source": config.cb0_source,
+                        "depformer_mode": config.depformer_mode,
+                        "generation": gen_cfg,
+                    },
+                    indent=2,
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            entries.append({"file": str(source), "output_dir": str(file_dir), "error": None})
+            print(f"[{index}/{len(files)}] ok: {source}")
+        except Exception as exc:  # one bad file must not stop the folder
+            logger.warning("inference failed for %s: %s", source, exc)
+            entries.append({"file": str(source), "output_dir": str(file_dir), "error": str(exc)})
+            print(f"[{index}/{len(files)}] failed: {source}: {exc}")
+
+    report = {
+        "input_dir": str(input_dir),
+        "adapter": str(adapter),
+        "count": len(entries),
+        "failed": sum(entry["error"] is not None for entry in entries),
+        "files": entries,
+    }
+    (output_dir / "folder_summary.json").write_text(
+        json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
+    return report

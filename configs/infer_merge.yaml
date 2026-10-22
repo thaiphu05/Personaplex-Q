@@ -1,0 +1,92 @@
+# Inference config for a Qwen + merge checkpoint.
+#
+# CB0 = cb0_head + cb0_depth_gate * depformer step 0.
+# The three mode keys below MUST match the checkpoint's adapter.json:
+#   cb0_source: merge
+#   depformer_mode: lora      (lora | full)
+#   audio_decoder: depformer  (depformer | heads)
+#
+# The adapter is passed on the command line, not stored here:
+#   python -m tools.inference_smoke \
+#     --config configs/infer_merge.yaml \
+#     --adapter runs/<run>/checkpoints/best \
+#     --index 0 --output-dir outputs/infer_merge
+#
+# Or a whole folder of user WAVs (one output subdir per file):
+#   python -m tools.inference_smoke \
+#     --config configs/infer_merge.yaml \
+#     --adapter runs/<run>/checkpoints/best \
+#     --input-dir /path/to/wavs \
+#     --voice-prompt /path/to/voice.wav \
+#     --text-prompt "You enjoy having a good conversation." \
+#     --output-dir outputs/infer_merge_folder
+#
+# Or score unseen samples:
+#   python -m personaplex_finetuning.evaluate \
+#     --config configs/infer_merge.yaml \
+#     --checkpoint runs/<run>/checkpoints/best \
+#     --manifest <prepared>/val.jsonl --limit 5
+
+seed: 42
+
+model:
+  root: /home/voice/data/voice/personaplex-7b-v1   # PersonaPlex-7B: Mimi + depformer + Helium embeddings
+  source: ../src                                    # repo src/ (vendored moshi)
+  device: cuda
+  backbone: qwen
+  qwen_id: /home/voice/data/models/Qwen3-0.6B       # local dir or HF id; must match training
+  # qwen_id: Qwen/Qwen3-0.6B
+
+data:
+  prepared_dir: /home/voice/data/voice/vdt/data_ready/synthetic_500h
+  window_seconds: 100
+  # Inference only: must be a path that exists and contains train.jsonl/val.jsonl.
+  codec_cache_dir: null        # no need to write cache during inference
+
+lora:
+  # Must match the adapter shapes saved at training time (adapter.json).
+  qwen_rank: 64
+  qwen_alpha: 128
+  depformer_rank: 64
+  depformer_alpha: 128
+  qwen_targets: "q_proj,v_proj,k_proj,o_proj"   # lora/qwen.yaml default; use "q_proj,v_proj" only if trained that way
+  ft_embed: true
+  depformer_mode: lora
+  qlora: false
+
+cb0_source: merge
+audio_decoder: depformer
+text_prompt_template: auto
+
+# Loss weights are recorded in config.json/adapter.json; they do not change the
+# forward pass, but keep them consistent so a resumed run matches the checkpoint.
+first_codebook_weight_multiplier: 1.0
+nonsemantic_audio_weight: 1.0
+text_padding_weight: 0.3
+text_loss_weight: 0.5
+epad_as_padding: false
+user_loss: false
+
+train:
+  output_dir: ../runs/infer_merge
+  max_steps: 1
+  warmup_steps: 0
+  eval_every_steps: 0
+  save_every_steps: 1
+  gradient_accumulation_steps: 1
+  mixed_precision: bf16
+  infer_every_steps: 0
+  infer_samples: 1
+  final_eval_samples: 0
+
+generation:
+  use_sampling: true
+  temp: 0.8
+  temp_text: 0.7
+  top_k: 250
+  top_k_text: 25
+  audio_silence_frame_cnt: 6
+
+# Greedy fallback when diagnosing choppy audio:
+#   python -m tools.inference_smoke --config configs/infer_merge.yaml \
+#     --adapter ... generation.use_sampling=false

@@ -22,7 +22,7 @@ def run_benchmark_cli(args: list[str] | None = None) -> int:
     parser.add_argument("--voice_prompt", type=Path, default=Path("prepared/samples/conv_0001/voice_prompt_left.wav"), help="Default voice prompt audio.")
     parser.add_argument("--gt_dist", type=Path, default=Path("benchmarks/datasets/fdb_v1/icc_gt_distribution.json"), help="Path to ICC ground-truth distribution.")
     parser.add_argument("--output_dir", type=Path, default=Path("benchmarks/results"), help="Directory to save benchmark reports.")
-    parser.add_argument("--max_samples_per_task", type=int, default=10, help="Maximum samples to evaluate per task.")
+    parser.add_argument("--max_samples_per_task", type=int, default=10, help="Maximum samples to evaluate per task (0 = all).")
     parser.add_argument("--mock", action="store_true", help="Run with mock runner for dry-run verification.")
     parser.add_argument("--compare_demo", action="store_true", help="Run side-by-side demo comparison (Base vs LoRA).")
     parser.add_argument("--device", type=str, default="auto", help="Inference device ('auto', 'cuda', 'mps', 'cpu').")
@@ -68,9 +68,10 @@ def run_benchmark_cli(args: list[str] | None = None) -> int:
 
     # Filter by task and cap max samples
     tasks = ["pause_synthetic", "pause_natural", "backchannel", "turn_taking", "interruption"]
+    cap = parsed.max_samples_per_task or None  # 0 = all
     capped_samples: list[BenchmarkSample] = []
     for t in tasks:
-        t_samples = [s for s in all_samples if s.task == t][:parsed.max_samples_per_task]
+        t_samples = [s for s in all_samples if s.task == t][:cap]
         capped_samples.extend(t_samples)
 
     console.print(f"[green]Total benchmark evaluation samples gathered: {len(capped_samples)}[/green]")

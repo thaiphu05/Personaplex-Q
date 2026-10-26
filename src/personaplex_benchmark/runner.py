@@ -175,7 +175,9 @@ class PersonaPlexStreamingRunner:
         import torch
 
         # Resolve device
-        if device == "auto" or device == "cuda" and not torch.cuda.is_available():
+        if device in ("auto", "cuda") and torch.cuda.is_available():
+            device = "cuda"
+        elif device in ("auto", "cuda"):
             if torch.backends.mps.is_available():
                 device = "mps"
             else:

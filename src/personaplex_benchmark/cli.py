@@ -28,6 +28,18 @@ def run_benchmark_cli(args: list[str] | None = None) -> int:
     parser.add_argument("--device", type=str, default="auto", help="Inference device ('auto', 'cuda', 'mps', 'cpu').")
 
     parsed = parser.parse_args(args)
+    if parsed.config is not None:
+        # The config's ``benchmark:`` section sets defaults; explicit flags still win.
+        from omegaconf import OmegaConf
+
+        section = OmegaConf.to_container(OmegaConf.load(str(parsed.config))).get("benchmark") or {}
+        known = {action.dest for action in parser._actions} - {"help", "config"}
+        unknown = sorted(set(section) - known)
+        if unknown:
+            parser.error(f"unknown benchmark keys in {parsed.config}: {', '.join(unknown)}")
+        parser.set_defaults(**{key: str(value) if value is not None and not isinstance(value, (bool, int)) else value
+                               for key, value in section.items()})
+        parsed = parser.parse_args(args)
     console = Console()
     reporter = BenchmarkReporter(console=console)
 
@@ -105,6 +117,12 @@ def run_benchmark_cli(args: list[str] | None = None) -> int:
         aggregated_rows.append(row)
 
     else:
+        # Fail before loading the model: FDB samples all share --voice_prompt.
+        missing = sorted({str(s.voice_prompt_wav) for s in capped_samples
+                          if s.voice_prompt_wav is None or not Path(s.voice_prompt_wav).is_file()})
+        if missing:
+            console.print(f"[bold red]Voice prompt not found: {', '.join(missing)}[/bold red] (pass --voice_prompt <wav>)")
+            return 1
         console.print(f"\n[bold green]Initializing PersonaPlex Streaming Runner on {parsed.device}...[/bold green]")
         config = None
         model_root = parsed.model_root

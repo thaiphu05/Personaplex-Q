@@ -1,0 +1,49 @@
+# Full-Duplex-Bench config for a Qwen3-8B + merge checkpoint.
+#
+#   python -m personaplex_benchmark --config configs/benchmark.yaml \
+#     --adapter runs/<run>/checkpoints/<ckpt> \
+#     --voice_prompt /path/to/voice_prompt_left.wav
+#
+# Every key under ``benchmark:`` is a CLI flag default; a flag on the command
+# line overrides it. Relative paths resolve from the working directory.
+# The model/lora/cb0 keys MUST match the checkpoint's adapter.json.
+
+benchmark:
+  adapter: /home/voice/code/VDT_02/thaitp/Personaplex-Q-main/runs/new_arc_v6.2_merge/train_20261026_053621_145783/checkpoints/best
+  voice_prompt: null           # agent voice WAV (required for FDB): set here or pass --voice_prompt
+  model_name: Qwen8B-merge     # display name in the report
+  fdb_dir: /home/voice/code/VDT_02/thaitp/FDB-v1-synthetic-main/out/fdb_v1_vi   # takes priority over prepared_dir
+  prepared_dir: null           # in-domain samples (used only when fdb_dir does not exist)
+  gt_dist: benchmarks/datasets/fdb_v1/icc_gt_distribution.json
+  output_dir: benchmarks/results_fdb
+  max_samples_per_task: 0      # 0 = every sample
+  device: cuda
+
+seed: 42
+
+model:
+  root: /home/voice/data/voice/personaplex-7b-v1   # PersonaPlex-7B: Mimi + depformer + Helium embeddings
+  source: ../src                                    # repo src/ (vendored moshi)
+  device: cuda
+  backbone: qwen
+  qwen_id: Qwen/Qwen3-8B                            # local dir or HF id; must match training
+
+data:
+  prepared_dir: /home/voice/data/voice/vdt/data_ready/synthetic_500h   # required by the config loader
+  window_seconds: 100
+  codec_cache_dir: null
+
+lora:
+  # Must match the adapter shapes saved at training time (adapter.json).
+  qwen_rank: 64
+  qwen_alpha: 128
+  depformer_rank: 64
+  depformer_alpha: 128
+  qwen_targets: "q_proj,v_proj,k_proj,o_proj"
+  ft_embed: true
+  depformer_mode: lora         # lora | full
+  qlora: false
+
+cb0_source: merge
+audio_decoder: depformer
+text_prompt_template: auto

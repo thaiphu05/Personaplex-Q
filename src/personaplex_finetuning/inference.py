@@ -152,6 +152,43 @@ def step_training_system_prompts(generator, voice_codes, device) -> None:
     generator._step_audio_silence()
 
 
+def build_generator(config: Config, runtime, model, gen_cfg: dict | None = None):
+    """LMGen set up as training expects; starts the Qwen KV cache.
+
+    The caller stops the cache (``model.stop_streaming_caches()``) once the
+    conversation ends.
+    """
+    import importlib
+
+    if config.backbone == "qwen":
+        model.start_streaming_caches()
+    gen = gen_cfg or {}
+    lm_module = importlib.import_module("moshi.models.lm")
+    generator = lm_module.LMGen(
+        model, audio_silence_frame_cnt=int(gen.get("audio_silence_frame_cnt", 6)),
+        sample_rate=runtime.codec.sample_rate, frame_rate=runtime.codec.frame_rate,
+        device=str(config.device), use_sampling=bool(gen.get("use_sampling", True)),
+        temp=float(gen.get("temp", 0.8)), temp_text=float(gen.get("temp_text", 0.7)),
+        top_k=int(gen.get("top_k", 250)), top_k_text=int(gen.get("top_k_text", 25)),
+    )
+    # LMGen hardcodes Helium's PAD id (3) as the text token of the voice-prompt and
+    # silence frames. Training fills those frames with the tokenizer's PAD, which
+    # for Qwen is a different id (3 is '$' there): use the same token here.
+    generator.zero_text_code = runtime.tokenizer.padding_id
+    return generator
+
+
+def prepare_prompts(config: Config, runtime, generator, voice_prompt_wav, text_prompt: str):
+    """Set the text prompt tokens and return the training voice-prompt codes.
+
+    Call before entering Mimi streaming; inside the generator's streaming
+    context, run ``align_generator_with_training`` then
+    ``step_training_system_prompts`` with the returned codes.
+    """
+    generator.text_prompt_tokens = encode_system_prompt(runtime.tokenizer, text_prompt, config.text_prompt_template)
+    return runtime.codec.encode_voice_prompt(voice_prompt_wav)
+
+
 def generate(
     config: Config,
     sample: PreparedSample,
@@ -174,24 +211,9 @@ def generate(
         attach_adapter(config, model, adapter)
     model.eval()
     cache_streaming = config.backbone == "qwen"
-    if cache_streaming:
-        model.start_streaming_caches()
-    gen = gen_cfg or {}
-    lm_module = importlib.import_module("moshi.models.lm")
     compile_module = importlib.import_module("moshi.utils.compile")
-    generator = lm_module.LMGen(
-        model, audio_silence_frame_cnt=int(gen.get("audio_silence_frame_cnt", 6)),
-        sample_rate=runtime.codec.sample_rate, frame_rate=runtime.codec.frame_rate,
-        device=str(config.device), use_sampling=bool(gen.get("use_sampling", True)),
-        temp=float(gen.get("temp", 0.8)), temp_text=float(gen.get("temp_text", 0.7)),
-        top_k=int(gen.get("top_k", 250)), top_k_text=int(gen.get("top_k_text", 25)),
-    )
-    # LMGen hardcodes Helium's PAD id (3) as the text token of the voice-prompt and
-    # silence frames. Training fills those frames with the tokenizer's PAD, which
-    # for Qwen is a different id (3 is '$' there): use the same token here.
-    generator.zero_text_code = runtime.tokenizer.padding_id
-    voice_codes = runtime.codec.encode_voice_prompt(sample.voice_prompt_wav)
-    generator.text_prompt_tokens = encode_system_prompt(runtime.tokenizer, sample.text_prompt, config.text_prompt_template)
+    generator = build_generator(config, runtime, model, gen_cfg)
+    voice_codes = prepare_prompts(config, runtime, generator, sample.voice_prompt_wav, sample.text_prompt)
     user_codes = runtime.codec.encode_conversation(sample.conversation_wav, sample.user_channel, sample.window_start_sec, sample.window_end_sec)
     user = torch.tensor(user_codes, device=config.device).unsqueeze(0)
     pcm_frames: list[np.ndarray] = []

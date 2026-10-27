@@ -245,24 +245,34 @@ class PersonaPlexStreamingRunner:
         self.lm_module = importlib.import_module("moshi.models.lm")
 
     def evaluate_sample(self, sample: BenchmarkSample) -> SampleEvaluationResult:
+        import contextlib
+        import importlib
+
         import torch
 
-        generator = self.lm_module.LMGen(
-            self.runtime.model,
-            audio_silence_frame_cnt=6,
-            sample_rate=self.runtime.codec.sample_rate,
-            frame_rate=self.runtime.codec.frame_rate,
-            device=self.device,
-            use_sampling=False,
-        )
+        model = self.runtime.model
+        if self.config is not None:
+            # Same generator and prompt path as ``inference.generate`` (Qwen KV
+            # cache, tokenizer PAD, frame alignment, training voice codes).
+            from personaplex_finetuning.inference import build_generator, prepare_prompts
 
-        from personaplex_finetuning.text_normalization import encode_system_prompt
+            generator = build_generator(
+                self.config, self.runtime, model, {"use_sampling": False, "audio_silence_frame_cnt": 6}
+            )
+            voice_codes = prepare_prompts(self.config, self.runtime, generator, sample.voice_prompt_wav, sample.text_prompt)
+        else:
+            from personaplex_finetuning.text_normalization import encode_system_prompt
 
-        generator.load_voice_prompt(str(sample.voice_prompt_wav))
-        template = getattr(self.config, "text_prompt_template", "native") if self.config else "native"
-        if template == "auto":
-            template = "qwen" if self.backbone == "qwen" else "native"
-        generator.text_prompt_tokens = encode_system_prompt(self.runtime.tokenizer, sample.text_prompt, template)
+            generator = self.lm_module.LMGen(
+                model,
+                audio_silence_frame_cnt=6,
+                sample_rate=self.runtime.codec.sample_rate,
+                frame_rate=self.runtime.codec.frame_rate,
+                device=self.device,
+                use_sampling=False,
+            )
+            generator.load_voice_prompt(str(sample.voice_prompt_wav))
+            generator.text_prompt_tokens = encode_system_prompt(self.runtime.tokenizer, sample.text_prompt, "native")
 
         user_codes = self.runtime.codec.encode_conversation(
             sample.conversation_wav,
@@ -277,23 +287,43 @@ class PersonaPlexStreamingRunner:
 
         frame_duration_sec = 1.0 / self.runtime.codec.frame_rate  # 0.08s for 12.5 Hz
 
-        with torch.no_grad(), generator.streaming(1):
-            generator.step_system_prompts(self.runtime.codec.mimi)
-            for f in range(user.shape[-1]):
-                curr_time = sample.window_start_sec + (f * frame_duration_sec)
-                tokens = generator.step(input_tokens=user[:, :, f : f + 1])
-                if tokens is None:
-                    continue
+        cache_streaming = self.backbone == "qwen"
+        if self.config is not None:
+            from personaplex_finetuning.inference import inference_autocast
 
-                token_id = int(tokens[0, 0, 0])
-                ignored = {0, int(self.runtime.tokenizer.padding_id),
-                           int(getattr(self.runtime.tokenizer, "end_padding_id", 0))}
-                if token_id not in ignored:
-                    from personaplex_finetuning.text_frames import token_piece
+            autocast = inference_autocast(self.config)
+        else:
+            autocast = contextlib.nullcontext()
+        # A growing KV cache cannot be replayed by CUDA graphs.
+        compile_module = importlib.import_module("moshi.utils.compile")
+        graph_guard = compile_module.no_cuda_graph() if cache_streaming else contextlib.nullcontext()
+        try:
+            with torch.no_grad(), autocast, graph_guard, generator.streaming(1):
+                if self.config is not None:
+                    from personaplex_finetuning.inference import align_generator_with_training, step_training_system_prompts
 
-                    piece = token_piece(self.runtime.tokenizer, token_id).replace("▁", " ").replace("Ġ", " ")
-                    frame_tokens.append((curr_time, piece))
-                    all_text_tokens.append(piece)
+                    align_generator_with_training(generator)
+                    step_training_system_prompts(generator, voice_codes, self.device)
+                else:
+                    generator.step_system_prompts(self.runtime.codec.mimi)
+                for f in range(user.shape[-1]):
+                    curr_time = sample.window_start_sec + (f * frame_duration_sec)
+                    tokens = generator.step(input_tokens=user[:, :, f : f + 1])
+                    if tokens is None:
+                        continue
+
+                    token_id = int(tokens[0, 0, 0])
+                    ignored = {0, int(self.runtime.tokenizer.padding_id),
+                               int(getattr(self.runtime.tokenizer, "end_padding_id", 0))}
+                    if token_id not in ignored:
+                        from personaplex_finetuning.text_frames import token_piece
+
+                        piece = token_piece(self.runtime.tokenizer, token_id).replace("▁", " ").replace("Ġ", " ")
+                        frame_tokens.append((curr_time, piece))
+                        all_text_tokens.append(piece)
+        finally:
+            if cache_streaming:
+                model.stop_streaming_caches()
 
         events = cluster_tokens_into_speech_events(frame_tokens, max_gap_sec=0.4)
         agent_full_text = "".join(all_text_tokens).strip()

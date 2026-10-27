@@ -180,6 +180,24 @@ def extract_samples_from_prepared_dir(
     return samples
 
 
+def text_prompt_for_voice(voice_wav: Path | None) -> str | None:
+    """Text prompt paired with a prepared voice prompt, from its ``metadata.json``.
+
+    ``voice_prompt_right.wav`` pairs with ``text_prompt_right``, any other
+    voice file in the sample dir with ``text_prompt_left``. None when the
+    voice file is not inside a prepared sample dir.
+    """
+    if voice_wav is None:
+        return None
+    meta_file = Path(voice_wav).parent / "metadata.json"
+    if not meta_file.is_file():
+        return None
+    meta = json.loads(meta_file.read_text(encoding="utf-8"))
+    key = "text_prompt_right" if "right" in Path(voice_wav).stem else "text_prompt_left"
+    prompt = str(meta.get(key) or "").strip()
+    return prompt or None
+
+
 def load_fdb_v1_dataset(
     extracted_root: Path,
     default_voice_prompt: Path,

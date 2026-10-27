@@ -49,15 +49,24 @@ def run_benchmark_cli(args: list[str] | None = None) -> int:
 
     # 1. Collect benchmark samples
     all_samples: list[BenchmarkSample] = []
-    from .contract import load_fdb_v1_dataset
+    from .contract import load_fdb_v1_dataset, text_prompt_for_voice
 
     # Priority 1: Official Full-Duplex-Bench dataset
     if parsed.fdb_dir and parsed.fdb_dir.is_dir():
         console.print(f"[dim]Loading official Full-Duplex-Bench v1.0 dataset from: {parsed.fdb_dir}[/dim]")
+        # The voice prompt's own sample carries the text prompt it was trained with.
+        prompt_kwargs = {}
+        paired_prompt = text_prompt_for_voice(parsed.voice_prompt)
+        if paired_prompt:
+            prompt_kwargs["default_text_prompt"] = paired_prompt
+            console.print(f"[dim]Text prompt (from voice prompt metadata): {paired_prompt[:120]}[/dim]")
+        else:
+            console.print("[yellow]No metadata.json next to the voice prompt: using the default English text prompt.[/yellow]")
         fdb_samples = load_fdb_v1_dataset(
             extracted_root=parsed.fdb_dir,
             default_voice_prompt=parsed.voice_prompt,
             gt_distribution_path=parsed.gt_dist,
+            **prompt_kwargs,
         )
         all_samples.extend(fdb_samples)
 
